@@ -39,6 +39,15 @@ a signal), and resume it later by issuing the same command::
 
     scrapy crawl somespider -s JOBDIR=crawls/somespider-1
 
+.. note::
+
+    With the default scheduler, requests that had already been dispatched
+    when the crawl stopped are lost, and their fingerprints may prevent
+    them from being scheduled again. If you need dispatched-but-unfinished
+    requests to be delivered again after an abrupt stop, consider the
+    :ref:`SQLite scheduler <topics-scheduler-sqlite>`, which provides
+    at-least-once delivery with explicit acknowledgements.
+
 .. _topics-keeping-persistent-state-between-batches:
 
 Keeping persistent state between batches

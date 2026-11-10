@@ -127,6 +127,16 @@ class ExecutionEngine:
             )
         return scheduler_cls
 
+    @property
+    def scheduler(self) -> BaseScheduler | None:
+        """The scheduler of the current crawl.
+
+        ``None`` if no spider is currently open. Useful to call
+        scheduler-specific APIs from business code, e.g.
+        :meth:`scrapy.core.sqlite_scheduler.SQLiteScheduler.ack_request`.
+        """
+        return self._slot.scheduler if self._slot is not None else None
+
     @deferred_f_from_coro_f
     async def start(self, _start_request_processing=True) -> None:
         if self.running:

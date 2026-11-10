@@ -1675,7 +1675,10 @@ SCHEDULER
 Default: ``'scrapy.core.scheduler.Scheduler'``
 
 The scheduler class to be used for crawling.
-See the :ref:`topics-scheduler` topic for details.
+See the :ref:`topics-scheduler` topic for details. Set it to
+``'scrapy.core.sqlite_scheduler.SQLiteScheduler'`` for a recoverable
+scheduler with at-least-once delivery (see
+:ref:`topics-scheduler-sqlite`).
 
 .. setting:: SCHEDULER_DEBUG
 
