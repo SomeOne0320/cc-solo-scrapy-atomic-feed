@@ -1,61 +1,64 @@
+from __future__ import annotations
+
 import sys
-import os
+from importlib import import_module
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from scrapy.xlib.pydispatch import dispatcher
-from scrapy.contrib.exporter import XmlItemExporter
-from scrapy.command import ScrapyCommand
-from scrapy.core.manager import scrapymanager
-from scrapy.core import signals
+from scrapy.commands import BaseRunSpiderCommand
+from scrapy.exceptions import UsageError
+from scrapy.utils.spider import iter_spider_classes
 
-def _import_file(filepath):
-    abspath = os.path.abspath(filepath)
-    dirname, file = os.path.split(abspath)
-    fname, fext = os.path.splitext(file)
-    if fext != '.py':
-        raise ValueError("Only Python files supported: %s" % abspath)
-    if dirname:
-        sys.path = [dirname] + sys.path
+if TYPE_CHECKING:
+    import argparse
+    from os import PathLike
+    from types import ModuleType
+
+
+def _import_file(filepath: str | PathLike[str]) -> ModuleType:
+    abspath = Path(filepath).resolve()
+    if abspath.suffix not in (".py", ".pyw"):
+        raise ValueError(f"Not a Python source file: {abspath}")
+    dirname = str(abspath.parent)
+    sys.path = [dirname, *sys.path]
     try:
-        module = __import__(fname, {}, {}, [''])
+        module = import_module(abspath.stem)
     finally:
-        if dirname:
-            sys.path.pop(0)
+        sys.path.pop(0)
     return module
 
 
-class Command(ScrapyCommand):
-
+class Command(BaseRunSpiderCommand):
     requires_project = False
+    default_settings = {"SPIDER_LOADER_WARN_ONLY": True}
 
-    def syntax(self):
+    def syntax(self) -> str:
         return "[options] <spider_file>"
 
-    def short_desc(self):
-        return "Run a spider"
+    def short_desc(self) -> str:
+        return "Run a self-contained spider (without creating a project)"
 
-    def long_desc(self):
-        return "Run the spider defined in the given file. The file must be a " \
-            "Python module which defines a SPIDER variable with a instance of " \
-            "the spider to run."
+    def long_desc(self) -> str:
+        return "Run the spider defined in the given file"
 
-    def add_options(self, parser):
-        super(Command, self).add_options(parser)
-        parser.add_option("--output", dest="output", metavar="FILE",
-            help="store scraped items to FILE in XML format")
-
-    def run(self, args, opts):
+    def run(self, args: list[str], opts: argparse.Namespace) -> None:
         if len(args) != 1:
-            return False
-        if opts.output:
-            file = open(opts.output, 'w+b')
-            exporter = XmlItemExporter(file)
-            dispatcher.connect(exporter.export_item, signal=signals.item_passed)
-            exporter.start_exporting()
-        module = _import_file(args[0])
+            raise UsageError
+        filename = Path(args[0])
+        if not filename.exists():
+            raise UsageError(f"File not found: {filename}\n")
+        try:
+            module = _import_file(filename)
+        except (ImportError, ValueError) as e:
+            raise UsageError(f"Unable to load {str(filename)!r}: {e}\n")
+        spclasses = list(iter_spider_classes(module))
+        if not spclasses:
+            raise UsageError(f"No spider found in file: {filename}\n")
+        spidercls = spclasses.pop()
 
-        # schedule spider and start engine
-        scrapymanager.queue.append_spider(module.SPIDER)
-        scrapymanager.start()
+        assert self.crawler_process
+        self.crawler_process.crawl(spidercls, **opts.spargs)
+        self.crawler_process.start()
 
-        if opts.output:
-            exporter.finish_exporting()
+        if self.crawler_process.bootstrap_failed:
+            self.exitcode = 1

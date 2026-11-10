@@ -1,14 +1,10 @@
-from scrapy.spider import BaseSpider
+import scrapy
 
-class $classname(BaseSpider):
+
+class $classname(scrapy.Spider):
     name = "$name"
     allowed_domains = ["$domain"]
-    start_urls = (
-        'http://www.$domain/',
-        )
+    start_urls = ["$url"]
 
     def parse(self, response):
-        pass 
-
-SPIDER = $classname()
-
+        pass

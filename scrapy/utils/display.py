@@ -1,43 +1,51 @@
 """
-Helper functions for formatting and pretty printing some objects
+pprint and pformat wrappers with colorization support
 """
+
+import ctypes
+import platform
 import sys
-import pprint as pypprint
+from pprint import pformat as pformat_
+from typing import Any
 
-from scrapy.item import BaseItem
+from packaging.version import Version as parse_version
 
-nocolour = False
 
-def colorize(text):
-    if nocolour or not sys.stdout.isatty():
+def _enable_windows_terminal_processing() -> bool:
+    # https://stackoverflow.com/a/36760881
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    return bool(kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7))
+
+
+def _tty_supports_color() -> bool:
+    if sys.platform != "win32":
+        return True
+
+    if parse_version(platform.version()) < parse_version("10.0.14393"):
+        return True
+
+    # Windows >= 10.0.14393 interprets ANSI escape sequences providing terminal
+    # processing is enabled.
+    return _enable_windows_terminal_processing()
+
+
+def _colorize(text: str, colorize: bool = True) -> str:
+    # pylint: disable=no-name-in-module
+    if not colorize or not sys.stdout.isatty() or not _tty_supports_color():
         return text
     try:
         from pygments import highlight
-        from pygments.formatters import TerminalFormatter
-        from pygments.lexers import PythonLexer
-        return highlight(text, PythonLexer(), TerminalFormatter())
     except ImportError:
         return text
+    from pygments.formatters import TerminalFormatter
+    from pygments.lexers import PythonLexer
 
-def _pformat_dictobj(obj):
-    clsname = obj.__class__.__name__
-    return "%s(%s)\n" % (clsname, colorize(pypprint.pformat(obj.__dict__)))
+    return highlight(text, PythonLexer(), TerminalFormatter())
 
-def pformat(obj, *args, **kwargs):
-    """
-    Wrapper which autodetects the object type and uses the proper formatting
-    function
-    """
-    if isinstance(obj, BaseItem):
-        return _pformat_dictobj(obj)
-    elif hasattr(obj, '__iter__'):
-        return "".join(map(pformat, obj))
-    else:
-        return colorize(pypprint.pformat(repr(obj)))
 
-def pprint(obj, *args, **kwargs):
-    """
-    Wrapper which autodetects the object type and uses the proper printing
-    function
-    """
-    print pformat(obj, *args, **kwargs)
+def pformat(obj: Any, *args: Any, **kwargs: Any) -> str:
+    return _colorize(pformat_(obj), kwargs.pop("colorize", True))
+
+
+def pprint(obj: Any, *args: Any, **kwargs: Any) -> None:
+    print(pformat(obj, *args, **kwargs))

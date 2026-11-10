@@ -1,20 +1,24 @@
-"""Download handler for file:// scheme"""
-from __future__ import with_statement
+from __future__ import annotations
 
-from urllib import url2pathname
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from twisted.internet import defer
-from scrapy.core.downloader.responsetypes import responsetypes
+from w3lib.url import file_uri_to_path
+
+from scrapy.responsetypes import responsetypes
+from scrapy.utils.decorators import defers
+
+if TYPE_CHECKING:
+    from scrapy import Request, Spider
+    from scrapy.http import Response
 
 
-def download_file(request, spider):
-    """Return a deferred for a file download."""
-    return defer.maybeDeferred(_all_in_one_read_download_file, request, spider)
+class FileDownloadHandler:
+    lazy = False
 
-def _all_in_one_read_download_file(request, spider):
-    filepath = url2pathname(request.url.split("file://")[1])
-    with open(filepath) as f:
-        body = f.read()
-    respcls = responsetypes.from_args(filename=filepath, body=body)
-    return respcls(url=request.url, body=body)
-
+    @defers
+    def download_request(self, request: Request, spider: Spider) -> Response:
+        filepath = file_uri_to_path(request.url)
+        body = Path(filepath).read_bytes()
+        respcls = responsetypes.from_args(filename=filepath, body=body)
+        return respcls(url=request.url, body=body)

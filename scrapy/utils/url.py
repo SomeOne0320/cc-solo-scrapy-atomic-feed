@@ -3,153 +3,202 @@ This module contains general purpose URL functions not found in the standard
 library.
 """
 
+from __future__ import annotations
+
 import re
-import urlparse
-import urllib
-import posixpath
-import cgi
+import warnings
+from importlib import import_module
+from typing import TYPE_CHECKING, Union
+from urllib.parse import ParseResult, urldefrag, urlparse, urlunparse
+from warnings import warn
 
-from scrapy.utils.python import unicode_to_str
+from w3lib.url import __all__ as _public_w3lib_objects
+from w3lib.url import add_or_replace_parameter as _add_or_replace_parameter
+from w3lib.url import any_to_uri as _any_to_uri
+from w3lib.url import parse_url as _parse_url
 
-def url_is_from_any_domain(url, domains):
+from scrapy.exceptions import ScrapyDeprecationWarning
+
+
+def __getattr__(name: str):
+    if name in ("_unquotepath", "_safe_chars", "parse_url", *_public_w3lib_objects):
+        obj_type = "attribute" if name == "_safe_chars" else "function"
+        warnings.warn(
+            f"The scrapy.utils.url.{name} {obj_type} is deprecated, use w3lib.url.{name} instead.",
+            ScrapyDeprecationWarning,
+        )
+        return getattr(import_module("w3lib.url"), name)
+
+    raise AttributeError
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from scrapy import Spider
+
+UrlT = Union[str, bytes, ParseResult]
+
+
+def url_is_from_any_domain(url: UrlT, domains: Iterable[str]) -> bool:
     """Return True if the url belongs to any of the given domains"""
-    host = urlparse.urlparse(url).hostname
-
-    if host:
-        return any(((host == d) or (host.endswith('.%s' % d)) for d in domains))
-    else:
+    host = _parse_url(url).netloc.lower()
+    if not host:
         return False
+    domains = [d.lower() for d in domains]
+    return any((host == d) or (host.endswith(f".{d}")) for d in domains)
 
-def url_is_from_spider(url, spider):
+
+def url_is_from_spider(url: UrlT, spider: type[Spider]) -> bool:
     """Return True if the url belongs to the given spider"""
-    return url_is_from_any_domain(url, spider.allowed_domains)
+    return url_is_from_any_domain(
+        url, [spider.name, *getattr(spider, "allowed_domains", [])]
+    )
 
-def urljoin_rfc(base, ref, encoding='utf-8'):
-    """Same as urlparse.urljoin but supports unicode values in base and ref
-    parameters (in which case they will be converted to str using the given
-    encoding).
 
-    Always returns a str.
+def url_has_any_extension(url: UrlT, extensions: Iterable[str]) -> bool:
+    """Return True if the url ends with one of the extensions provided"""
+    lowercase_path = _parse_url(url).path.lower()
+    return any(lowercase_path.endswith(ext) for ext in extensions)
+
+
+def escape_ajax(url: str) -> str:
     """
-    return urlparse.urljoin(unicode_to_str(base, encoding), \
-        unicode_to_str(ref, encoding))
+    Return the crawlable url
 
-_reserved = ';/?:@&=+$|,#' # RFC 3986 (Generic Syntax)
-_unreserved_marks = "-_.!~*'()" # RFC 3986 sec 2.3
-_safe_chars = urllib.always_safe + '%' + _reserved + _unreserved_marks
+    >>> escape_ajax("www.example.com/ajax.html#!key=value")
+    'www.example.com/ajax.html?_escaped_fragment_=key%3Dvalue'
+    >>> escape_ajax("www.example.com/ajax.html?k1=v1&k2=v2#!key=value")
+    'www.example.com/ajax.html?k1=v1&k2=v2&_escaped_fragment_=key%3Dvalue'
+    >>> escape_ajax("www.example.com/ajax.html?#!key=value")
+    'www.example.com/ajax.html?_escaped_fragment_=key%3Dvalue'
+    >>> escape_ajax("www.example.com/ajax.html#!")
+    'www.example.com/ajax.html?_escaped_fragment_='
 
-def safe_url_string(url, encoding='utf8'):
-    """Convert the given url into a legal URL by escaping unsafe characters
-    according to RFC-3986.
+    URLs that are not "AJAX crawlable" (according to Google) returned as-is:
 
-    If a unicode url is given, it is first converted to str using the given
-    encoding (which defaults to 'utf-8'). When passing a encoding, you should
-    use the encoding of the original page (the page from which the url was
-    extracted from).
-
-    Calling this function on an already "safe" url will return the url
-    unmodified.
-
-    Always returns a str.
+    >>> escape_ajax("www.example.com/ajax.html#key=value")
+    'www.example.com/ajax.html#key=value'
+    >>> escape_ajax("www.example.com/ajax.html#")
+    'www.example.com/ajax.html#'
+    >>> escape_ajax("www.example.com/ajax.html")
+    'www.example.com/ajax.html'
     """
-    s = unicode_to_str(url, encoding)
-    return urllib.quote(s,  _safe_chars)
+    warn(
+        "escape_ajax() is deprecated and will be removed in a future Scrapy version.",
+        ScrapyDeprecationWarning,
+        stacklevel=2,
+    )
+    defrag, frag = urldefrag(url)
+    if not frag.startswith("!"):
+        return url
+    return _add_or_replace_parameter(defrag, "_escaped_fragment_", frag[1:])
 
 
-_parent_dirs = re.compile(r'/?(\.\./)+')
+def add_http_if_no_scheme(url: str) -> str:
+    """Add http as the default scheme if it is missing from the url."""
+    match = re.match(r"^\w+://", url, flags=re.IGNORECASE)
+    if not match:
+        parts = urlparse(url)
+        scheme = "http:" if parts.netloc else "http://"
+        url = scheme + url
 
-def safe_download_url(url):
-    """ Make a url for download. This will call safe_url_string
-    and then strip the fragment, if one exists. The path will
-    be normalised.
+    return url
 
-    If the path is outside the document root, it will be changed
-    to be within the document root.
-    """
-    safe_url = safe_url_string(url)
-    scheme, netloc, path, query, _ = urlparse.urlsplit(safe_url)
-    if path:
-        path = _parent_dirs.sub('', posixpath.normpath(path))
-        if url.endswith('/') and not path.endswith('/'):
-            path += '/'
-    else:
-        path = '/'
-    return urlparse.urlunsplit((scheme, netloc, path, query, ''))
 
-def is_url(text):
-    return text.partition("://")[0] in ('file', 'http', 'https')
+def _is_posix_path(string: str) -> bool:
+    return bool(
+        re.match(
+            r"""
+            ^                   # start with...
+            (
+                \.              # ...a single dot,
+                (
+                    \. | [^/\.]+  # optionally followed by
+                )?                # either a second dot or some characters
+                |
+                ~   # $HOME
+            )?      # optional match of ".", ".." or ".blabla"
+            /       # at least one "/" for a file path,
+            .       # and something after the "/"
+            """,
+            string,
+            flags=re.VERBOSE,
+        )
+    )
 
-def url_query_parameter(url, parameter, default=None, keep_blank_values=0):
-    """Return the value of a url parameter, given the url and parameter name"""
-    queryparams = cgi.parse_qs(urlparse.urlsplit(str(url))[3], \
-        keep_blank_values=keep_blank_values)
-    return queryparams.get(parameter, [default])[0]
 
-def url_query_cleaner(url, parameterlist=(), sep='&', kvsep='=', remove=False, unique=True):
-    """Clean url arguments leaving only those passed in the parameterlist keeping order
+def _is_windows_path(string: str) -> bool:
+    return bool(
+        re.match(
+            r"""
+            ^
+            (
+                [a-z]:\\
+                | \\\\
+            )
+            """,
+            string,
+            flags=re.IGNORECASE | re.VERBOSE,
+        )
+    )
 
-    If remove is True, leave only those not in parameterlist.
-    If unique is False, do not remove duplicated keys
-    """
-    url = urlparse.urldefrag(url)[0]
-    base, _, query = url.partition('?')
-    seen = set()
-    querylist = []
-    for ksv in query.split(sep):
-        k, _, _ = ksv.partition(kvsep)
-        if unique and k in seen:
-            continue
-        elif remove and k in parameterlist:
-            continue
-        elif not remove and k not in parameterlist:
-            continue
-        else:
-            querylist.append(ksv)
-            seen.add(k)
-    return '?'.join([base, sep.join(querylist)]) if querylist else base
 
-def add_or_replace_parameter(url, name, new_value, sep='&', url_is_quoted=False):
-    """Add or remove a parameter to a given url"""
-    def has_querystring(url):
-        _, _, _, query, _ = urlparse.urlsplit(url)
-        return bool(query)
+def _is_filesystem_path(string: str) -> bool:
+    return _is_posix_path(string) or _is_windows_path(string)
 
-    parameter = url_query_parameter(url, name, keep_blank_values=1)
-    if url_is_quoted:
-        parameter = urllib.quote(parameter)
-    if parameter is None:
-        if has_querystring(url):
-            next_url = url + sep + name + '=' + new_value
-        else:
-            next_url = url + '?' + name + '=' + new_value
-    else:
-        next_url = url.replace(name+'='+parameter,
-                               name+'='+new_value)
-    return next_url
 
-def canonicalize_url(url, keep_blank_values=True, keep_fragments=False, \
-        encoding=None):
-    """Canonicalize the given url by applying the following procedures:
+def guess_scheme(url: str) -> str:
+    """Add an URL scheme if missing: file:// for filepath-like input or
+    http:// otherwise."""
+    if _is_filesystem_path(url):
+        return _any_to_uri(url)
+    return add_http_if_no_scheme(url)
 
-    - sort query arguments, first by key, then by value
-    - percent encode paths and query arguments. non-ASCII characters are
-      percent-encoded using UTF-8 (RFC-3986)
-    - normalize all spaces (in query arguments) '+' (plus symbol)
-    - normalize percent encodings case (%2f -> %2F)
-    - remove query arguments with blank values (unless keep_blank_values is True)
-    - remove fragments (unless keep_fragments is True)
 
-    The url passed can be a str or unicode, while the url returned is always a
-    str.
+def strip_url(
+    url: str,
+    strip_credentials: bool = True,
+    strip_default_port: bool = True,
+    origin_only: bool = False,
+    strip_fragment: bool = True,
+) -> str:
+    """Strip URL string from some of its components:
 
-    For examples see the tests in scrapy.tests.test_utils_url
+    - ``strip_credentials`` removes "user:password@"
+    - ``strip_default_port`` removes ":80" (resp. ":443", ":21")
+      from http:// (resp. https://, ftp://) URLs
+    - ``origin_only`` replaces path component with "/", also dropping
+      query and fragment components ; it also strips credentials
+    - ``strip_fragment`` drops any #fragment component
     """
 
-    url = unicode_to_str(url, encoding)
-    scheme, netloc, path, params, query, fragment = urlparse.urlparse(url)
-    keyvals = cgi.parse_qsl(query, keep_blank_values)
-    keyvals.sort()
-    query = urllib.urlencode(keyvals)
-    path = urllib.quote(urllib.unquote(path))
-    fragment = '' if not keep_fragments else fragment
-    return urlparse.urlunparse((scheme, netloc, path, params, query, fragment))
+    parsed_url = urlparse(url)
+    netloc = parsed_url.netloc
+    if (strip_credentials or origin_only) and (
+        parsed_url.username or parsed_url.password
+    ):
+        netloc = netloc.split("@")[-1]
+
+    if (
+        strip_default_port
+        and parsed_url.port
+        and (parsed_url.scheme, parsed_url.port)
+        in (
+            ("http", 80),
+            ("https", 443),
+            ("ftp", 21),
+        )
+    ):
+        netloc = netloc.replace(f":{parsed_url.port}", "")
+
+    return urlunparse(
+        (
+            parsed_url.scheme,
+            netloc,
+            "/" if origin_only else parsed_url.path,
+            "" if origin_only else parsed_url.params,
+            "" if origin_only else parsed_url.query,
+            "" if strip_fragment else parsed_url.fragment,
+        )
+    )

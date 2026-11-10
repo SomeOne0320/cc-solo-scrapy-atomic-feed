@@ -4,165 +4,98 @@
 Scrapy at a glance
 ==================
 
-Scrapy a is an application framework for crawling web sites and extracting
+Scrapy (/ˈskreɪpaɪ/) is an application framework for crawling web sites and extracting
 structured data which can be used for a wide range of useful applications, like
 data mining, information processing or historical archival.
 
-Even though Scrapy was originally designed for `screen scraping`_ (more
-precisely, `web scraping`_), it can also be used to extract data using APIs
-(such as `Amazon Associates Web Services`_) or as a general purpose web
-crawler.
-
-.. _screen scraping: http://en.wikipedia.org/wiki/Screen_scraping
-.. _web scraping: http://en.wikipedia.org/wiki/Web_scraping
-.. _Amazon Associates Web Services: http://aws.amazon.com/associates/
-
-The purpose of this document is to introduce you to the concepts behind Scrapy
-so you can get an idea of how it works and decide if Scrapy is what you need. 
-
-When you're ready to start a project, you can :ref:`start with the tutorial
-<intro-tutorial>`.
-
-Pick a website
-==============
-
-So you need to extract some information from a website, but the website doesn't
-provide any API or mechanism to access that info from a computer program.
-Scrapy can help you extract that information. Let's say we want to extract
-information about all torrent files added today in the `mininova`_ torrent
-site.
-
-.. _mininova: http://www.mininova.org
-
-The list of all torrents added today can be found in this page:
-
-    http://www.mininova.org/today
-    
-Write a Spider to extract the Items
-===================================
-
-Now we'll write a Spider which defines the start URL
-(http://www.mininova.org/today), the rules for following links and the rules
-for extracting the data from pages.
-
-If we take a look at that page content we'll see that all torrent URLs are like
-http://www.mininova.org/tor/NUMBER where ``NUMBER`` is an integer. We'll use
-that to construct the regular expression for the links to follow: ``/tor/\d+``.
-
-For extracting data we'll use `XPath`_ to select the part of the document where
-the data is to be extracted. Let's take one of those torrent pages:
-
-    http://www.mininova.org/tor/2657665
-
-.. _XPath: http://www.w3.org/TR/xpath
-  
-And look at the page HTML source to construct the XPath to select the data we
-want to extract which is: torrent name, description and size.
-
-.. highlight:: html
-
-By looking at the page HTML source we can see that the file name is contained
-inside a ``<h1>`` tag::
-
-   <h1>Home[2009][Eng]XviD-ovd</h1>
-
-.. highlight:: none
-
-An XPath expression to extract the name could be::
-
-    //h1/text()
-
-.. highlight:: html
-
-And the description is contained inside a ``<div>`` tag with ``id="description"``::
-
-   <h2>Description:</h2>
-
-   <div id="description">
-   "HOME" - a documentary film by Yann Arthus-Bertrand
-   <br/>
-   <br/>
-   ***
-   <br/>
-   <br/>
-   "We are living in exceptional times. Scientists tell us that we have 10 years to change the way we live, avert the depletion of natural resources and the catastrophic evolution of the Earth's climate.
-
-   ...
-
-.. highlight:: none
-
-An XPath expression to select the description could be::
-
-    //div[@id='description']
-
-.. highlight:: html
-
-Finally, the file size is contained in the second ``<p>`` tag inside the ``<div>``
-tag with ``id=specifications``::
-
-   <div id="specifications">
-
-   <p>
-   <strong>Category:</strong>
-   <a href="/cat/4">Movies</a> &gt; <a href="/sub/35">Documentary</a>
-   </p>
-
-   <p>
-   <strong>Total size:</strong>
-   699.79&nbsp;megabyte</p>
+Even though Scrapy was originally designed for `web scraping`_, it can also be
+used to extract data using APIs (such as `Amazon Associates Web Services`_) or
+as a general purpose web crawler.
 
 
-.. highlight:: none
+Walk-through of an example spider
+=================================
 
-An XPath expression to select the description could be::
+In order to show you what Scrapy brings to the table, we'll walk you through an
+example of a Scrapy Spider using the simplest way to run a spider.
 
-   //div[@id='specifications']/p[2]/text()[2]
+Here's the code for a spider that scrapes famous quotes from website
+https://quotes.toscrape.com, following the pagination:
 
-.. highlight:: python
+.. code-block:: python
 
-For more information about XPath see the `XPath reference`_.
-
-.. _XPath reference: http://www.w3.org/TR/xpath
-
-Finally, here's the spider code::
-
-    class MininovaSpider(CrawlSpider):
-
-        name = 'mininova.org'
-        allowed_domains = ['mininova.org']
-        start_urls = ['http://www.mininova.org/today']
-        rules = [Rule(SgmlLinkExtractor(allow=['/tor/\d+']), 'parse_torrent')]
-        
-        def parse_torrent(self, response):
-            x = HtmlXPathSelector(response)
-
-            torrent = TorrentItem()
-            torrent['url'] = response.url
-            torrent['name'] = x.select("//h1/text()").extract()
-            torrent['description'] = x.select("//div[@id='description']").extract()
-            torrent['size'] = x.select("//div[@id='info-left']/p[2]/text()[2]").extract()
-            return torrent
+    import scrapy
 
 
-For brevity sake, we intentionally left out the import statements and the
-Torrent class definition (which is included some paragraphs above).
+    class QuotesSpider(scrapy.Spider):
+        name = "quotes"
+        start_urls = [
+            "https://quotes.toscrape.com/tag/humor/",
+        ]
 
-Write a pipeline to store the items extracted
-=============================================
+        def parse(self, response):
+            for quote in response.css("div.quote"):
+                yield {
+                    "author": quote.xpath("span/small/text()").get(),
+                    "text": quote.css("span.text::text").get(),
+                }
 
-Now let's write an :ref:`topics-item-pipeline` that serializes and stores the
-extracted item into a file using `pickle`_::
+            next_page = response.css('li.next a::attr("href")').get()
+            if next_page is not None:
+                yield response.follow(next_page, self.parse)
 
-    import pickle
+Put this in a text file, name it something like ``quotes_spider.py``
+and run the spider using the :command:`runspider` command::
 
-    class StoreItemPipeline(object):
-        def process_item(self, spider, item):
-            torrent_id = item['url'].split('/')[-1]
-            f = open("torrent-%s.pickle" % torrent_id, "w")
-            pickle.dump(item, f)
-            f.close()
+    scrapy runspider quotes_spider.py -o quotes.jsonl
 
-.. _pickle: http://docs.python.org/library/pickle.html
+When this finishes you will have in the ``quotes.jsonl`` file a list of the
+quotes in JSON Lines format, containing the text and author, which will look like this::
+
+    {"author": "Jane Austen", "text": "\u201cThe person, be it gentleman or lady, who has not pleasure in a good novel, must be intolerably stupid.\u201d"}
+    {"author": "Steve Martin", "text": "\u201cA day without sunshine is like, you know, night.\u201d"}
+    {"author": "Garrison Keillor", "text": "\u201cAnyone who thinks sitting in church can make you a Christian must also think that sitting in a garage can make you a car.\u201d"}
+    ...
+
+
+What just happened?
+-------------------
+
+When you ran the command ``scrapy runspider quotes_spider.py``, Scrapy looked for a
+Spider definition inside it and ran it through its crawler engine.
+
+The crawl started by making requests to the URLs defined in the ``start_urls``
+attribute (in this case, only the URL for quotes in the *humor* category)
+and called the default callback method ``parse``, passing the response object as
+an argument. In the ``parse`` callback, we loop through the quote elements
+using a CSS Selector, yield a Python dict with the extracted quote text and author,
+look for a link to the next page and schedule another request using the same
+``parse`` method as callback.
+
+Here you will notice one of the main advantages of Scrapy: requests are
+:ref:`scheduled and processed asynchronously <topics-architecture>`.  This
+means that Scrapy doesn't need to wait for a request to be finished and
+processed, it can send another request or do other things in the meantime. This
+also means that other requests can keep going even if a request fails or an
+error happens while handling it.
+
+While this enables you to do very fast crawls (sending multiple concurrent
+requests at the same time, in a fault-tolerant way) Scrapy also gives you
+control over the politeness of the crawl through :ref:`a few settings
+<topics-settings-ref>`. You can do things like setting a download delay between
+each request, limiting the amount of concurrent requests per domain or per IP, and
+even :ref:`using an auto-throttling extension <topics-autothrottle>` that tries
+to figure these settings out automatically.
+
+.. note::
+
+    This is using :ref:`feed exports <topics-feed-exports>` to generate the
+    JSON file, you can easily change the export format (XML or CSV, for example) or the
+    storage backend (FTP or `Amazon S3`_, for example).  You can also write an
+    :ref:`item pipeline <topics-item-pipeline>` to store the items in a database.
+
+
+.. _topics-whatelse:
 
 What else?
 ==========
@@ -172,40 +105,53 @@ this is just the surface. Scrapy provides a lot of powerful features for making
 scraping easy and efficient, such as:
 
 * Built-in support for :ref:`selecting and extracting <topics-selectors>` data
-  from HTML and XML sources
+  from HTML/XML sources using extended CSS selectors and XPath expressions,
+  with helper methods for extraction using regular expressions.
 
-* Built-in support for :ref:`exporting data <file-export-pipeline>` in multiple
-  formats, including XML, CSV and JSON
+* An :ref:`interactive shell console <topics-shell>` (IPython aware) for trying
+  out the CSS and XPath expressions to scrape data, which is very useful when writing or
+  debugging your spiders.
 
-* A media pipeline for :ref:`automatically downloading images <topics-images>`
-  (or any other media) associated with the scraped items
+* Built-in support for :ref:`generating feed exports <topics-feed-exports>` in
+  multiple formats (JSON, CSV, XML) and storing them in multiple backends (FTP,
+  S3, local filesystem)
 
-* Support for :ref:`extending Scrapy <extending-scrapy>` by plugging
-  your own functionality using middlewares, extensions, and pipelines
+* Robust encoding support and auto-detection, for dealing with foreign,
+  non-standard and broken encoding declarations.
 
-* Wide range of built-in middlewares and extensions for handling of
-  compression, cache, cookies, authentication, user-agent spoofing, robots.txt
-  handling, statistics, crawl depth restriction, etc
+* :ref:`Strong extensibility support <extending-scrapy>`, allowing you to plug
+  in your own functionality using :ref:`signals <topics-signals>` and a
+  well-defined API (middlewares, :ref:`extensions <topics-extensions>`, and
+  :ref:`pipelines <topics-item-pipeline>`).
 
-* An :ref:`Interactive scraping shell console <topics-shell>`, very useful for
-  writing and debugging your spiders
+* A wide range of built-in extensions and middlewares for handling:
 
-* A :ref:`Web management console <topics-webconsole>` for monitoring and
-  controlling your bot
+  - cookies and session handling
+  - HTTP features like compression, authentication, caching
+  - user-agent spoofing
+  - robots.txt
+  - crawl depth restriction
+  - and more
 
-* A :ref:`Telnet console <topics-telnetconsole>` for full unrestricted access
-  to a Python console inside your Scrapy process, to introspect and debug your
+* A :ref:`Telnet console <topics-telnetconsole>` for hooking into a Python
+  console running inside your Scrapy process, to introspect and debug your
   crawler
 
-* Built-in facilities for :ref:`logging <topics-logging>`, :ref:`collecting
-  stats <topics-stats>`, and :ref:`sending email notifications <topics-email>`
+* Plus other goodies like reusable spiders to crawl sites from `Sitemaps`_ and
+  XML/CSV feeds, a media pipeline for :ref:`automatically downloading images
+  <topics-media-pipeline>` (or any other media) associated with the scraped
+  items, a caching DNS resolver, and much more!
 
 What's next?
 ============
 
-The next obvious steps are for you to `download Scrapy`_, read :ref:`the
-tutorial <intro-tutorial>` and join `the community`_. Thanks for your
+The next steps for you are to :ref:`install Scrapy <intro-install>`,
+:ref:`follow through the tutorial <intro-tutorial>` to learn how to create
+a full-blown Scrapy project and `join the community`_. Thanks for your
 interest!
 
-.. _download Scrapy: http://scrapy.org/download/
-.. _the community: http://scrapy.org/community/
+.. _join the community: https://scrapy.org/community/
+.. _web scraping: https://en.wikipedia.org/wiki/Web_scraping
+.. _Amazon Associates Web Services: https://affiliate-program.amazon.com/welcome/ecs
+.. _Amazon S3: https://aws.amazon.com/s3/
+.. _Sitemaps: https://www.sitemaps.org/index.html

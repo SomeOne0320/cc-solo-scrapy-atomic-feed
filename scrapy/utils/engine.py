@@ -1,59 +1,53 @@
 """Some debugging functions for working with the Scrapy engine"""
 
-from time import time
+from __future__ import annotations
 
-from scrapy.core.manager import scrapymanager
+# used in global tests code
+from time import time  # noqa: F401
+from typing import TYPE_CHECKING, Any
 
-def get_engine_status(engine=None):
+if TYPE_CHECKING:
+    from scrapy.core.engine import ExecutionEngine
+
+
+def get_engine_status(engine: ExecutionEngine) -> list[tuple[str, Any]]:
     """Return a report of the current engine status"""
-    if engine is None:
-        engine = scrapymanager.engine
-
-    global_tests = [
+    tests = [
         "time()-engine.start_time",
-        "engine.is_idle()",
-        "engine.has_capacity()",
-        "engine.scheduler.is_idle()",
-        "len(engine.scheduler.pending_requests)",
-        "engine.downloader.is_idle()",
-        "len(engine.downloader.sites)",
+        "len(engine.downloader.active)",
         "engine.scraper.is_idle()",
-        "len(engine.scraper.sites)",
-    ]
-    spider_tests = [
-        "engine.spider_is_idle(spider)",
-        "engine.closing.get(spider)",
-        "engine.scheduler.spider_has_pending_requests(spider)",
-        "len(engine.scheduler.pending_requests[spider])",
-        "len(engine.downloader.sites[spider].queue)",
-        "len(engine.downloader.sites[spider].active)",
-        "len(engine.downloader.sites[spider].transferring)",
-        "engine.downloader.sites[spider].closing",
-        "engine.downloader.sites[spider].lastseen",
-        "len(engine.scraper.sites[spider].queue)",
-        "len(engine.scraper.sites[spider].active)",
-        "engine.scraper.sites[spider].active_size",
-        "engine.scraper.sites[spider].itemproc_size",
-        "engine.scraper.sites[spider].needs_backout()",
+        "engine.spider.name",
+        "engine.spider_is_idle()",
+        "engine._slot.closing",
+        "len(engine._slot.inprogress)",
+        "len(engine._slot.scheduler.dqs or [])",
+        "len(engine._slot.scheduler.mqs)",
+        "len(engine.scraper.slot.queue)",
+        "len(engine.scraper.slot.active)",
+        "engine.scraper.slot.active_size",
+        "engine.scraper.slot.itemproc_size",
+        "engine.scraper.slot.needs_backout()",
     ]
 
-    s = "Execution engine status\n\n"
-
-    for test in global_tests:
+    checks: list[tuple[str, Any]] = []
+    for test in tests:
         try:
-            s += "%-47s : %s\n" % (test, eval(test))
-        except Exception, e:
-            s += "%-47s : %s (exception)\n" % (test, type(e).__name__)
+            checks += [(test, eval(test))]  # noqa: S307  # pylint: disable=eval-used
+        except Exception as e:
+            checks += [(test, f"{type(e).__name__} (exception)")]
+
+    return checks
+
+
+def format_engine_status(engine: ExecutionEngine) -> str:
+    checks = get_engine_status(engine)
+    s = "Execution engine status\n\n"
+    for test, result in checks:
+        s += f"{test:<47} : {result}\n"
     s += "\n"
-    for spider in engine.downloader.sites:
-        s += "Spider: %s\n" % spider
-        for test in spider_tests:
-            try:
-                s += "  %-50s : %s\n" % (test, eval(test))
-            except Exception, e:
-                s += "  %-50s : %s (exception)\n" % (test, type(e).__name__)
+
     return s
 
-def print_engine_status(engine=None):
-    print get_engine_status(engine)
 
+def print_engine_status(engine: ExecutionEngine) -> None:
+    print(format_engine_status(engine))

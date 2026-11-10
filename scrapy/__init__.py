@@ -1,28 +1,55 @@
 """
-Scrapy - a screen scraping framework written in Python
+Scrapy - a web crawling and web scraping framework written for Python
 """
 
-version_info = (0, 9, 0, 'dev')
-__version__ = "0.9-dev"
+import pkgutil
+import sys
+import warnings
 
-import sys, os, warnings
+# Declare top-level shortcuts
+from scrapy.http import FormRequest, Request
+from scrapy.item import Field, Item
+from scrapy.selector import Selector
+from scrapy.spiders import Spider
 
-if sys.version_info < (2,5):
-    print "Scrapy %s requires Python 2.5 or above" % __version__
-    sys.exit(1)
+__all__ = [
+    "Field",
+    "FormRequest",
+    "Item",
+    "Request",
+    "Selector",
+    "Spider",
+    "__version__",
+    "version_info",
+]
 
-# ignore noisy twisted deprecation warnings
-warnings.filterwarnings('ignore', category=DeprecationWarning, module='twisted')
 
-# monkey patches to fix external library issues
-from scrapy.xlib import twisted_250_monkeypatches
+# Scrapy and Twisted versions
+__version__ = (pkgutil.get_data(__package__, "VERSION") or b"").decode("ascii").strip()
+version_info = tuple(int(v) if v.isdigit() else v for v in __version__.split("."))
 
-# optional_features is a set containing Scrapy optional features
-optional_features = set()
 
-try:
-    import OpenSSL
-except ImportError:
-    pass
-else:
-    optional_features.add('ssl')
+def __getattr__(name: str):
+    if name == "twisted_version":
+        import warnings  # pylint: disable=reimported
+
+        from twisted import version as _txv
+
+        from scrapy.exceptions import ScrapyDeprecationWarning
+
+        warnings.warn(
+            "The scrapy.twisted_version attribute is deprecated, use twisted.version instead",
+            ScrapyDeprecationWarning,
+        )
+        return _txv.major, _txv.minor, _txv.micro
+
+    raise AttributeError
+
+
+# Ignore noisy twisted deprecation warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="twisted")
+
+
+del pkgutil
+del sys
+del warnings

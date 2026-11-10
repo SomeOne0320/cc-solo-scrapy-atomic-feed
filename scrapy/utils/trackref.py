@@ -2,61 +2,76 @@
 references to live object instances.
 
 If you want live objects for a particular class to be tracked, you only have to
-subclass form object_ref (instead of object). Also, remember to turn on
-tracking by enabling the TRACK_REFS setting.
+subclass from object_ref (instead of object).
 
 About performance: This library has a minimal performance impact when enabled,
 and no performance penalty at all when disabled (as object_ref becomes just an
 alias to object in that case).
 """
 
-import weakref
+from __future__ import annotations
+
 from collections import defaultdict
-from time import time
 from operator import itemgetter
-from types import NoneType
+from time import time
+from typing import TYPE_CHECKING, Any
+from weakref import WeakKeyDictionary
 
-from scrapy.conf import settings
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
-live_refs = defaultdict(weakref.WeakKeyDictionary)
+    # typing.Self requires Python 3.11
+    from typing_extensions import Self
 
-class object_ref(object):
-    """Inherit from this class (instead of object) to a keep a record of live
-    instances"""
+
+NoneType = type(None)
+live_refs: defaultdict[type, WeakKeyDictionary] = defaultdict(WeakKeyDictionary)
+
+
+class object_ref:
+    """Inherit from this class to a keep a record of live instances"""
 
     __slots__ = ()
 
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls, *args: Any, **kwargs: Any) -> Self:
         obj = object.__new__(cls)
         live_refs[cls][obj] = time()
         return obj
 
-if not settings.getbool('TRACK_REFS'):
-    object_ref = object
 
-def print_live_refs(ignore=NoneType):
-    if object_ref is object:
-        print "The trackref module is disabled. Use TRACK_REFS setting to enable it."
-        return
-    print "Live References"
-    print
+# using Any as it's hard to type type(None)
+def format_live_refs(ignore: Any = NoneType) -> str:
+    """Return a tabular representation of tracked objects"""
+    s = "Live References\n\n"
     now = time()
-    for cls, wdict in live_refs.iteritems():
+    for cls, wdict in sorted(live_refs.items(), key=lambda x: x[0].__name__):
         if not wdict:
             continue
         if issubclass(cls, ignore):
             continue
-        oldest = min(wdict.itervalues())
-        print "%-30s %6d   oldest: %ds ago" % (cls.__name__, len(wdict), \
-            now-oldest)
+        oldest = min(wdict.values())
+        s += f"{cls.__name__:<30} {len(wdict):6}   oldest: {int(now - oldest)}s ago\n"
+    return s
 
-def get_oldest(class_name):
-    for cls, wdict in live_refs.iteritems():
-        if cls.__name__ == class_name:
-            if wdict:
-                return min(wdict.iteritems(), key=itemgetter(1))[0]
 
-def iter_all(class_name):
-    for cls, wdict in live_refs.iteritems():
+def print_live_refs(*a: Any, **kw: Any) -> None:
+    """Print tracked objects"""
+    print(format_live_refs(*a, **kw))
+
+
+def get_oldest(class_name: str) -> Any:
+    """Get the oldest object for a specific class name"""
+    for cls, wdict in live_refs.items():
         if cls.__name__ == class_name:
-            return wdict.iterkeys()
+            if not wdict:
+                break
+            return min(wdict.items(), key=itemgetter(1))[0]
+    return None
+
+
+def iter_all(class_name: str) -> Iterable[Any]:
+    """Iterate over all objects of the same class by its class name"""
+    for cls, wdict in live_refs.items():
+        if cls.__name__ == class_name:
+            return wdict.keys()
+    return []

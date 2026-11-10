@@ -1,101 +1,119 @@
 """
-This module implements the Downloader Middleware manager. For more information
-see the Downloader Middleware doc in:
+Downloader Middleware manager
 
-docs/topics/downloader-middleware.rst
-
+See documentation in docs/topics/downloader-middleware.rst
 """
 
-from scrapy.core import signals
-from scrapy.utils.signal import send_catch_log
-from scrapy import log
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, cast
+
+from twisted.internet.defer import Deferred, inlineCallbacks
+
+from scrapy.exceptions import _InvalidOutput
 from scrapy.http import Request, Response
-from scrapy.core.exceptions import NotConfigured
-from scrapy.utils.misc import load_object
-from scrapy.utils.defer import mustbe_deferred
+from scrapy.middleware import MiddlewareManager
 from scrapy.utils.conf import build_component_list
-from scrapy.conf import settings
+from scrapy.utils.defer import deferred_from_coro, mustbe_deferred
 
-class DownloaderMiddlewareManager(object):
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
-    def __init__(self):
-        self.loaded = False
-        self.enabled = {}
-        self.disabled = {}
-        self.request_middleware = []
-        self.response_middleware = []
-        self.exception_middleware = []
-        self.load()
+    from twisted.python.failure import Failure
 
-    def _add_middleware(self, mw):
-        if hasattr(mw, 'process_request'):
-            self.request_middleware.append(mw.process_request)
-        if hasattr(mw, 'process_response'):
-            self.response_middleware.insert(0, mw.process_response)
-        if hasattr(mw, 'process_exception'):
-            self.exception_middleware.insert(0, mw.process_exception)
+    from scrapy import Spider
+    from scrapy.settings import BaseSettings
 
-    def load(self):
-        """Load middleware defined in settings module"""
-        mwlist = build_component_list(settings['DOWNLOADER_MIDDLEWARES_BASE'], \
-            settings['DOWNLOADER_MIDDLEWARES'])
-        self.enabled.clear()
-        self.disabled.clear()
-        for mwpath in mwlist:
-            try:
-                cls = load_object(mwpath)
-                mw = cls()
-                self.enabled[cls.__name__] = mw
-                self._add_middleware(mw)
-            except NotConfigured, e:
-                self.disabled[cls.__name__] = mwpath
-                if e.args:
-                    log.msg(e)
-        log.msg("Enabled downloader middlewares: %s" % ", ".join(self.enabled.keys()), \
-            level=log.DEBUG)
-        self.loaded = True
 
-    def download(self, download_func, request, spider):
-        def process_request(request):
-            for method in self.request_middleware:
-                response = method(request=request, spider=spider)
-                assert response is None or isinstance(response, (Response, Request)), \
-                        'Middleware %s.process_request must return None, Response or Request, got %s' % \
-                        (method.im_self.__class__.__name__, response.__class__.__name__)
+class DownloaderMiddlewareManager(MiddlewareManager):
+    component_name = "downloader middleware"
+
+    @classmethod
+    def _get_mwlist_from_settings(cls, settings: BaseSettings) -> list[Any]:
+        return build_component_list(settings.getwithbase("DOWNLOADER_MIDDLEWARES"))
+
+    def _add_middleware(self, mw: Any) -> None:
+        if hasattr(mw, "process_request"):
+            self.methods["process_request"].append(mw.process_request)
+        if hasattr(mw, "process_response"):
+            self.methods["process_response"].appendleft(mw.process_response)
+        if hasattr(mw, "process_exception"):
+            self.methods["process_exception"].appendleft(mw.process_exception)
+
+    def download(
+        self,
+        download_func: Callable[[Request, Spider], Deferred[Response]],
+        request: Request,
+        spider: Spider,
+    ) -> Deferred[Response | Request]:
+        @inlineCallbacks
+        def process_request(
+            request: Request,
+        ) -> Generator[Deferred[Any], Any, Response | Request]:
+            for method in self.methods["process_request"]:
+                method = cast(Callable, method)
+                response = yield deferred_from_coro(
+                    method(request=request, spider=spider)
+                )
+                if response is not None and not isinstance(
+                    response, (Response, Request)
+                ):
+                    raise _InvalidOutput(
+                        f"Middleware {method.__qualname__} must return None, Response or "
+                        f"Request, got {response.__class__.__name__}"
+                    )
                 if response:
                     return response
-            return download_func(request=request, spider=spider)
+            return (yield download_func(request, spider))
 
-        def process_response(response):
-            assert response is not None, 'Received None in process_response'
+        @inlineCallbacks
+        def process_response(
+            response: Response | Request,
+        ) -> Generator[Deferred[Any], Any, Response | Request]:
+            if response is None:
+                raise TypeError("Received None in process_response")
             if isinstance(response, Request):
                 return response
 
-            for method in self.response_middleware:
-                response = method(request=request, response=response, spider=spider)
-                assert isinstance(response, (Response, Request)), \
-                    'Middleware %s.process_response must return Response or Request, got %s' % \
-                    (method.im_self.__class__.__name__, type(response))
+            for method in self.methods["process_response"]:
+                method = cast(Callable, method)
+                response = yield deferred_from_coro(
+                    method(request=request, response=response, spider=spider)
+                )
+                if not isinstance(response, (Response, Request)):
+                    raise _InvalidOutput(
+                        f"Middleware {method.__qualname__} must return Response or Request, "
+                        f"got {type(response)}"
+                    )
                 if isinstance(response, Request):
-                    send_catch_log(signal=signals.response_received, \
-                        sender=self.__class__, response=response, spider=spider)
                     return response
-            send_catch_log(signal=signals.response_received, sender=self.__class__, \
-                response=response, spider=spider)
             return response
 
-        def process_exception(_failure):
-            exception = _failure.value
-            for method in self.exception_middleware:
-                response = method(request=request, exception=exception, spider=spider)
-                assert response is None or isinstance(response, (Response, Request)), \
-                    'Middleware %s.process_exception must return None, Response or Request, got %s' % \
-                    (method.im_self.__class__.__name__, type(response))
+        @inlineCallbacks
+        def process_exception(
+            failure: Failure,
+        ) -> Generator[Deferred[Any], Any, Failure | Response | Request]:
+            exception = failure.value
+            for method in self.methods["process_exception"]:
+                method = cast(Callable, method)
+                response = yield deferred_from_coro(
+                    method(request=request, exception=exception, spider=spider)
+                )
+                if response is not None and not isinstance(
+                    response, (Response, Request)
+                ):
+                    raise _InvalidOutput(
+                        f"Middleware {method.__qualname__} must return None, Response or "
+                        f"Request, got {type(response)}"
+                    )
                 if response:
                     return response
-            return _failure
+            return failure
 
-        deferred = mustbe_deferred(process_request, request)
+        deferred: Deferred[Response | Request] = mustbe_deferred(
+            process_request, request
+        )
         deferred.addErrback(process_exception)
         deferred.addCallback(process_response)
         return deferred

@@ -1,157 +1,251 @@
-"""
-Scrapy Shell
+"""Scrapy Shell
 
 See documentation in docs/topics/shell.rst
+
 """
 
+from __future__ import annotations
+
+import contextlib
 import os
-import urllib
-import urlparse
 import signal
+from typing import TYPE_CHECKING, Any
 
-from twisted.internet import reactor, threads
+from itemadapter import is_item
+from twisted.internet import defer, threads
+from twisted.python import threadable
+from w3lib.url import any_to_uri
 
-from scrapy.spider import BaseSpider, spiders
-from scrapy.selector import XmlXPathSelector, HtmlXPathSelector
+from scrapy.crawler import Crawler
+from scrapy.exceptions import IgnoreRequest
+from scrapy.http import Request, Response
+from scrapy.settings import Settings
+from scrapy.spiders import Spider
+from scrapy.utils.conf import get_config
+from scrapy.utils.console import DEFAULT_PYTHON_SHELLS, start_python_console
+from scrapy.utils.datatypes import SequenceExclude
+from scrapy.utils.defer import deferred_f_from_coro_f, maybe_deferred_to_future
 from scrapy.utils.misc import load_object
+from scrapy.utils.reactor import is_asyncio_reactor_installed, set_asyncio_event_loop
 from scrapy.utils.response import open_in_browser
-from scrapy.conf import settings
-from scrapy.core.manager import scrapymanager
-from scrapy.core.queue import KeepAliveExecutionQueue
-from scrapy.http import Request, TextResponse
 
-def relevant_var(varname):
-    return varname not in ['shelp', 'fetch', 'view', '__builtins__', 'In', \
-        'Out', 'help'] and not varname.startswith('_')
-
-def parse_url(url):
-    """Parse url which can be a direct path to a direct file"""
-    url = url.strip()
-    if url:
-        u = urlparse.urlparse(url)
-        if not u.scheme:
-            path = os.path.abspath(url).replace(os.sep, '/')
-            url = 'file://' + urllib.pathname2url(path)
-            u = urlparse.urlparse(url)
-    return url
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
-class Shell(object):
+class Shell:
+    relevant_classes: tuple[type, ...] = (Crawler, Spider, Request, Response, Settings)
 
-    def __init__(self, update_vars=None, nofetch=False):
-        self.vars = {}
-        self.update_vars = update_vars
-        self.item_class = load_object(settings['DEFAULT_ITEM_CLASS'])
-        self.nofetch = nofetch
+    def __init__(
+        self,
+        crawler: Crawler,
+        update_vars: Callable[[dict[str, Any]], None] | None = None,
+        code: str | None = None,
+    ):
+        self.crawler: Crawler = crawler
+        self.update_vars: Callable[[dict[str, Any]], None] = update_vars or (
+            lambda x: None
+        )
+        self.item_class: type = load_object(crawler.settings["DEFAULT_ITEM_CLASS"])
+        self.spider: Spider | None = None
+        self.inthread: bool = not threadable.isInIOThread()
+        self.code: str | None = code
+        self.vars: dict[str, Any] = {}
 
-    def fetch(self, request_or_url, print_help=False):
-        if isinstance(request_or_url, Request):
-            request = request_or_url
-            url = request.url
-        else:
-            url = parse_url(request_or_url)
-            request = Request(url)
-
-        spider = spiders.create_for_request(request, BaseSpider('default'), \
-            log_multiple=True)
-
-        print "Fetching %s..." % request
-        scrapymanager.engine.open_spider(spider)
-        response = threads.blockingCallFromThread(reactor, scrapymanager.engine.schedule, \
-            request, spider)
-        if response:
-            self.populate_vars(url, response, request, spider)
-            if print_help:
-                self.print_help()
-            else:
-                print "Done - use shelp() to see available objects"
-
-    def populate_vars(self, url=None, response=None, request=None, spider=None):
-        item = self.item_class()
-        self.vars['item'] = item
-        if url:
-            if isinstance(response, TextResponse):
-                self.vars['xxs'] = XmlXPathSelector(response)
-                self.vars['hxs'] = HtmlXPathSelector(response)
-            self.vars['url'] = url
-            self.vars['response'] = response
-            self.vars['request'] = request
-            self.vars['spider'] = spider
-        if not self.nofetch:
-            self.vars['fetch'] = self.fetch
-        self.vars['view'] = open_in_browser
-        self.vars['shelp'] = self.print_help
-
-        if self.update_vars:
-            self.update_vars(self.vars)
-
-    def print_help(self):
-        print "Available objects"
-        print "================="
-        print
-        for k, v in self.vars.iteritems():
-            if relevant_var(k):
-                print "  %-10s: %s" % (k, v)
-        print
-        print "Available shortcuts"
-        print "==================="
-        print
-        print "  shelp()           : Prints this help."
-        if not self.nofetch:
-            print "  fetch(req_or_url) : Fetch a new request or URL and update objects"
-        print "  view(response)    : View response in a browser"
-        print
-
-    def start(self, url):
+    def start(
+        self,
+        url: str | None = None,
+        request: Request | None = None,
+        response: Response | None = None,
+        spider: Spider | None = None,
+        redirect: bool = True,
+    ) -> None:
         # disable accidental Ctrl-C key press from shutting down the engine
         signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-        reactor.callInThread(self._console_thread, url)
-        scrapymanager.queue = KeepAliveExecutionQueue()
-        scrapymanager.start()
-
-    def inspect_response(self, response):
-        print
-        print "Scrapy Shell"
-        print "============"
-        print
-        print "Inspecting: %s" % response
-        print "Use shelp() to see available objects"
-        print
-        request = response.request
-        url = request.url
-        self.populate_vars(url, response, request)
-        self._run_console()
-
-    def _run_console(self):
-        try:
-            try: # use IPython if available
-                import IPython
-                shell = IPython.Shell.IPShell(argv=[], user_ns=self.vars)
-                ip = shell.IP.getapi()
-                shell.mainloop()
-            except ImportError:
-                import code
-                try: # readline module is only available on unix systems
-                    import readline
-                except ImportError:
-                    pass
-                else:
-                    import rlcompleter
-                    readline.parse_and_bind("tab:complete")
-                code.interact(local=self.vars)
-        except SystemExit: # raised when using exit() in python code.interact
-            pass
-
-    def _console_thread(self, url=None):
-        self.populate_vars()
         if url:
-            result = self.fetch(url, print_help=True)
+            self.fetch(url, spider, redirect=redirect)
+        elif request:
+            self.fetch(request, spider)
+        elif response:
+            request = response.request
+            self.populate_vars(response, request, spider)
         else:
-            self.print_help()
-        self._run_console()
-        reactor.callFromThread(scrapymanager.stop)
+            self.populate_vars()
+        if self.code:
+            # pylint: disable-next=eval-used
+            print(eval(self.code, globals(), self.vars))  # noqa: S307
+        else:
+            # Detect interactive shell setting in scrapy.cfg
+            # e.g.: ~/.config/scrapy.cfg or ~/.scrapy.cfg
+            # [settings]
+            # # shell can be one of ipython, bpython or python;
+            # # to be used as the interactive python console, if available.
+            # # (default is ipython, fallbacks in the order listed above)
+            # shell = python
+            cfg = get_config()
+            section, option = "settings", "shell"
+            env = os.environ.get("SCRAPY_PYTHON_SHELL")
+            shells = []
+            if env:
+                shells += env.strip().lower().split(",")
+            elif cfg.has_option(section, option):
+                shells += [cfg.get(section, option).strip().lower()]
+            else:  # try all by default
+                shells += DEFAULT_PYTHON_SHELLS.keys()
+            # always add standard shell as fallback
+            shells += ["python"]
+            start_python_console(
+                self.vars, shells=shells, banner=self.vars.pop("banner", "")
+            )
 
-def inspect_response(response):
+    def _schedule(self, request: Request, spider: Spider | None) -> defer.Deferred[Any]:
+        if is_asyncio_reactor_installed():
+            # set the asyncio event loop for the current thread
+            event_loop_path = self.crawler.settings["ASYNCIO_EVENT_LOOP"]
+            set_asyncio_event_loop(event_loop_path)
+
+        def crawl_request(_):
+            assert self.crawler.engine is not None
+            self.crawler.engine.crawl(request)
+
+        d2 = self._open_spider(request, spider)
+        d2.addCallback(crawl_request)
+
+        d = _request_deferred(request)
+        d.addCallback(lambda x: (x, spider))
+        return d
+
+    @deferred_f_from_coro_f
+    async def _open_spider(self, request: Request, spider: Spider | None) -> None:
+        if self.spider:
+            return
+
+        if spider is None:
+            spider = self.crawler.spider or self.crawler._create_spider()
+
+        self.crawler.spider = spider
+        assert self.crawler.engine
+        await maybe_deferred_to_future(
+            self.crawler.engine.open_spider(spider, close_if_idle=False)
+        )
+        self.crawler.engine._start_request_processing()
+        self.spider = spider
+
+    def fetch(
+        self,
+        request_or_url: Request | str,
+        spider: Spider | None = None,
+        redirect: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        from twisted.internet import reactor
+
+        if isinstance(request_or_url, Request):
+            request = request_or_url
+        else:
+            url = any_to_uri(request_or_url)
+            request = Request(url, dont_filter=True, **kwargs)
+            if redirect:
+                request.meta["handle_httpstatus_list"] = SequenceExclude(
+                    range(300, 400)
+                )
+            else:
+                request.meta["handle_httpstatus_all"] = True
+        response = None
+        with contextlib.suppress(IgnoreRequest):
+            response, spider = threads.blockingCallFromThread(
+                reactor, self._schedule, request, spider
+            )
+        self.populate_vars(response, request, spider)
+
+    def populate_vars(
+        self,
+        response: Response | None = None,
+        request: Request | None = None,
+        spider: Spider | None = None,
+    ) -> None:
+        import scrapy
+
+        self.vars["scrapy"] = scrapy
+        self.vars["crawler"] = self.crawler
+        self.vars["item"] = self.item_class()
+        self.vars["settings"] = self.crawler.settings
+        self.vars["spider"] = spider
+        self.vars["request"] = request
+        self.vars["response"] = response
+        if self.inthread:
+            self.vars["fetch"] = self.fetch
+        self.vars["view"] = open_in_browser
+        self.vars["shelp"] = self.print_help
+        self.update_vars(self.vars)
+        if not self.code:
+            self.vars["banner"] = self.get_help()
+
+    def print_help(self) -> None:
+        print(self.get_help())
+
+    def get_help(self) -> str:
+        b = []
+        b.append("Available Scrapy objects:")
+        b.append(
+            "  scrapy     scrapy module (contains scrapy.Request, scrapy.Selector, etc)"
+        )
+        for k, v in sorted(self.vars.items()):
+            if self._is_relevant(v):
+                b.append(f"  {k:<10} {v}")
+        b.append("Useful shortcuts:")
+        if self.inthread:
+            b.append(
+                "  fetch(url[, redirect=True]) "
+                "Fetch URL and update local objects (by default, redirects are followed)"
+            )
+            b.append(
+                "  fetch(req)                  "
+                "Fetch a scrapy.Request and update local objects "
+            )
+        b.append("  shelp()           Shell help (print this help)")
+        b.append("  view(response)    View response in a browser")
+
+        return "\n".join(f"[s] {line}" for line in b)
+
+    def _is_relevant(self, value: Any) -> bool:
+        return isinstance(value, self.relevant_classes) or is_item(value)
+
+
+def inspect_response(response: Response, spider: Spider) -> None:
     """Open a shell to inspect the given response"""
-    Shell(nofetch=True).inspect_response(response)
+    # Shell.start removes the SIGINT handler, so save it and re-add it after
+    # the shell has closed
+    sigint_handler = signal.getsignal(signal.SIGINT)
+    Shell(spider.crawler).start(response=response, spider=spider)
+    signal.signal(signal.SIGINT, sigint_handler)
+
+
+def _request_deferred(request: Request) -> defer.Deferred[Any]:
+    """Wrap a request inside a Deferred.
+
+    This function is harmful, do not use it until you know what you are doing.
+
+    This returns a Deferred whose first pair of callbacks are the request
+    callback and errback. The Deferred also triggers when the request
+    callback/errback is executed (i.e. when the request is downloaded)
+
+    WARNING: Do not call request.replace() until after the deferred is called.
+    """
+    request_callback = request.callback
+    request_errback = request.errback
+
+    def _restore_callbacks(result: Any) -> Any:
+        request.callback = request_callback
+        request.errback = request_errback
+        return result
+
+    d: defer.Deferred[Any] = defer.Deferred()
+    d.addBoth(_restore_callbacks)
+    if request.callback:
+        d.addCallback(request.callback)
+    if request.errback:
+        d.addErrback(request.errback)
+
+    request.callback, request.errback = d.callback, d.errback
+    return d
