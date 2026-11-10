@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import re
 import sys
 import warnings
@@ -20,6 +21,7 @@ from urllib.parse import unquote, urlparse
 
 from twisted.internet.defer import Deferred, DeferredList, maybeDeferred
 from twisted.internet.threads import deferToThread
+from twisted.python.failure import Failure
 from w3lib.url import file_uri_to_path
 from zope.interface import Interface, implementer
 
@@ -37,7 +39,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from _typeshed import OpenBinaryMode
-    from twisted.python.failure import Failure
 
     # typing.Self requires Python 3.11
     from typing_extensions import Self
@@ -52,6 +53,16 @@ logger = logging.getLogger(__name__)
 UriParamsCallableT = Callable[[dict[str, Any], Spider], Optional[dict[str, Any]]]
 
 _StorageT = TypeVar("_StorageT", bound="FeedStorageProtocol")
+
+
+def _reject_atomic_write(uri: str, feed_options: dict[str, Any] | None) -> None:
+    """Raise an error if the atomic_write feed option is used with a storage
+    backend that cannot publish feeds atomically."""
+    if feed_options and feed_options.get("atomic_write"):
+        raise NotConfigured(
+            "The atomic_write feed option is only supported by the local file "
+            f"storage backend, not by feed URI: {uri}"
+        )
 
 
 def build_storage(
@@ -167,7 +178,13 @@ class StdoutFeedStorage:
         if not _stdout:
             _stdout = sys.stdout.buffer
         self._stdout: IO[bytes] = _stdout
-        if feed_options and feed_options.get("overwrite", False) is True:
+        feed_options = feed_options or {}
+        if feed_options.get("atomic_write"):
+            raise NotConfigured(
+                "The atomic_write feed option is not supported by the standard "
+                "output (stdout) storage. Use a local file feed URI instead."
+            )
+        if feed_options.get("overwrite", False) is True:
             logger.warning(
                 "Standard output (stdout) storage does not support "
                 "overwriting. To suppress this warning, remove the "
@@ -187,19 +204,68 @@ class FileFeedStorage:
     def __init__(self, uri: str, *, feed_options: dict[str, Any] | None = None):
         self.path: str = file_uri_to_path(uri) if uri.startswith("file://") else uri
         feed_options = feed_options or {}
+        self.atomic_write: bool = bool(feed_options.get("atomic_write", False))
+        if self.atomic_write and feed_options.get("overwrite", False) is not True:
+            raise NotConfigured(
+                "The atomic_write feed option requires the overwrite feed option "
+                f"to be set to True for feed URI: {uri}"
+            )
         self.write_mode: OpenBinaryMode = (
             "wb" if feed_options.get("overwrite", False) else "ab"
         )
+        # The temporary file used when atomic_write is enabled. It always lives
+        # in the same directory as the target file so that the final
+        # replacement is an atomic same-filesystem operation.
+        self._file: IO[bytes] | None = None
 
     def open(self, spider: Spider) -> IO[bytes]:
         dirname = Path(self.path).parent
         if dirname and not dirname.exists():
             dirname.mkdir(parents=True)
+        if self.atomic_write:
+            # delete=False keeps the file around if the process is killed;
+            # cleanup() removes it on failure.
+            self._file = NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{Path(self.path).name}.",
+                suffix=".tmp",
+                dir=dirname or None,
+                delete=False,
+            )
+            return self._file
         return Path(self.path).open(self.write_mode)
 
     def store(self, file: IO[bytes]) -> Deferred[None] | None:
+        if self.atomic_write:
+            try:
+                if not file.closed:
+                    file.flush()
+                    os.fsync(file.fileno())
+                    file.close()
+                # Path.replace() atomically replaces the target, preserving
+                # any existing file until this point.
+                Path(file.name).replace(self.path)
+            except BaseException:
+                # The batch is not published: keep any existing target file
+                # untouched and remove the temporary file.
+                self.cleanup()
+                raise
+            self._file = None
+            return None
         file.close()
         return None
+
+    def cleanup(self) -> None:
+        """Remove the temporary file of an unpublished atomic feed."""
+        if self._file is None:
+            return
+        file = self._file
+        self._file = None
+        with contextlib.suppress(Exception):
+            if not file.closed:
+                file.close()
+        with contextlib.suppress(OSError):
+            Path(file.name).unlink()
 
 
 class S3FeedStorage(BlockingFeedStorage):
@@ -240,6 +306,7 @@ class S3FeedStorage(BlockingFeedStorage):
             region_name=self.region_name,
         )
 
+        _reject_atomic_write(uri, feed_options)
         if feed_options and feed_options.get("overwrite", True) is False:
             logger.warning(
                 "S3 does not support appending to files. To "
@@ -291,6 +358,7 @@ class GCSFeedStorage(BlockingFeedStorage):
         self.bucket_name: str = u.hostname
         self.blob_name: str = u.path[1:]  # remove first "/"
 
+        _reject_atomic_write(uri, feed_options)
         if feed_options and feed_options.get("overwrite", True) is False:
             logger.warning(
                 "GCS does not support appending to files. To "
@@ -334,6 +402,7 @@ class FTPFeedStorage(BlockingFeedStorage):
         u = urlparse(uri)
         if not u.hostname:
             raise ValueError(f"Got a storage URI without a hostname: {uri}")
+        _reject_atomic_write(uri, feed_options)
         self.host: str = u.hostname
         self.port: int = int(u.port or "21")
         self.username: str = u.username or ""
@@ -405,6 +474,14 @@ class FeedSlot:
         self.itemcount: int = 0
         self._exporting: bool = False
         self._fileloaded: bool = False
+        # Set once the slot has gone through the close/store path, so that a
+        # slot closed mid-crawl (batches or failures) is not stored again when
+        # the spider shuts down.
+        self.closed: bool = False
+        # Set when exporting this slot failed. A failed slot is never
+        # published, even when the rest of the crawl closes normally.
+        self.export_failed: bool = False
+        self.export_error: BaseException | None = None
 
     def start_exporting(self) -> None:
         if not self._fileloaded:
@@ -508,6 +585,8 @@ class FeedExporter:
                 raise NotConfigured
             if not self._exporter_supported(feed_options["format"]):
                 raise NotConfigured
+            if not self._atomic_write_is_supported(uri, feed_options):
+                raise NotConfigured
 
     def open_spider(self, spider: Spider) -> None:
         for uri, feed_options in self.feeds.items():
@@ -543,26 +622,46 @@ class FeedExporter:
                 return slot_.file.file
             return slot_.file
 
-        if slot.itemcount:
-            # Normal case
-            slot.finish_exporting()
+        if slot.closed:
+            return None
+        slot.closed = True
+
+        logmsg = f"{slot.format} feed ({slot.itemcount} items) in: {slot.uri}"
+        slot_type = type(slot.storage).__name__
+
+        if slot.export_failed:
+            # Serialization failed while exporting this batch. Never publish
+            # it: route the remembered error through the usual error handling
+            # so the temporary output is cleaned up and the failure is visible
+            # through the feed export stats and logs.
+            assert slot.export_error is not None
+            d: Deferred[None] = Deferred()
+            d.errback(Failure(slot.export_error))
+        elif slot.itemcount:
+            # Normal case. maybeDeferred() makes sure that an exception raised
+            # while finalizing the exporter or the post-processing layers is
+            # reported as a store failure instead of tearing down the crawl.
+            d = maybeDeferred(slot.finish_exporting)
+            d.addCallback(
+                lambda _: maybeDeferred(  # type: ignore[call-overload]
+                    slot.storage.store, get_file(slot)
+                )
+            )
         elif slot.store_empty and slot.batch_id == 1:
             # Need to store the empty file
-            slot.start_exporting()
-            slot.finish_exporting()
+            d = maybeDeferred(slot.start_exporting)
+            d.addCallback(lambda _: maybeDeferred(slot.finish_exporting))
+            d.addCallback(
+                lambda _: maybeDeferred(  # type: ignore[call-overload]
+                    slot.storage.store, get_file(slot)
+                )
+            )
         else:
             # In this case, the file is not stored, so no processing is required.
             return None
 
-        logmsg = f"{slot.format} feed ({slot.itemcount} items) in: {slot.uri}"
-        d: Deferred[None] = maybeDeferred(slot.storage.store, get_file(slot))  # type: ignore[call-overload]
-
-        d.addCallback(
-            self._handle_store_success, logmsg, spider, type(slot.storage).__name__
-        )
-        d.addErrback(
-            self._handle_store_error, logmsg, spider, type(slot.storage).__name__
-        )
+        d.addCallback(self._handle_store_success, logmsg, spider, slot_type)
+        d.addErrback(self._handle_store_error, logmsg, spider, slot_type, slot)
         self._pending_deferreds.append(d)
         d.addCallback(
             lambda _: self.crawler.signals.send_catch_log_deferred(
@@ -574,7 +673,12 @@ class FeedExporter:
         return d
 
     def _handle_store_error(
-        self, f: Failure, logmsg: str, spider: Spider, slot_type: str
+        self,
+        f: Failure,
+        logmsg: str,
+        spider: Spider,
+        slot_type: str,
+        slot: FeedSlot,
     ) -> None:
         logger.error(
             "Error storing %s",
@@ -582,6 +686,11 @@ class FeedExporter:
             exc_info=failure_to_exc_info(f),
             extra={"spider": spider},
         )
+        # Discard unpublished output (e.g. the atomic-write temporary file)
+        # instead of leaving it behind.
+        cleanup = getattr(slot.storage, "cleanup", None)
+        if cleanup is not None:
+            cleanup()
         assert self.crawler.stats
         self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
 
@@ -626,7 +735,7 @@ class FeedExporter:
         )
 
     def item_scraped(self, item: Any, spider: Spider) -> None:
-        slots = []
+        slots: list[FeedSlot | None] = []
         for slot in self.slots:
             if not slot.filter.accepts(item):
                 slots.append(
@@ -634,9 +743,27 @@ class FeedExporter:
                 )  # if slot doesn't accept item, continue with next slot
                 continue
 
-            slot.start_exporting()
-            assert slot.exporter
-            slot.exporter.export_item(item)
+            try:
+                slot.start_exporting()
+                assert slot.exporter
+                slot.exporter.export_item(item)
+            except Exception as e:
+                if getattr(slot.storage, "atomic_write", False):
+                    # In atomic mode a partially written batch must never be
+                    # published. Close the slot right away: _close_slot() skips
+                    # publication, cleans up the temporary file and reports the
+                    # failure through the feed export stats and logs. The slot
+                    # is removed from the active slots so that the regular
+                    # spider shutdown cannot mistakenly treat it as successful.
+                    slot.export_failed = True
+                    slot.export_error = e
+                    self._close_slot(slot, spider)
+                    slots.append(None)
+                else:
+                    # Default (non-atomic) mode: preserve the historical
+                    # behavior of letting the signal machinery log the error.
+                    slots.append(slot)
+                raise
             slot.itemcount += 1
             # create new slot for each slot with itemcount == FEED_EXPORT_BATCH_ITEM_COUNT and close the old one
             if (
@@ -658,7 +785,7 @@ class FeedExporter:
                 )
             else:
                 slots.append(slot)
-        self.slots = slots
+        self.slots = [slot for slot in slots if slot is not None]
 
     def _load_components(self, setting_prefix: str) -> dict[str, Any]:
         conf = without_none_values(
@@ -708,6 +835,37 @@ class FeedExporter:
         else:
             logger.error("Unknown feed storage scheme: %(scheme)s", {"scheme": scheme})
         return False
+
+    def _atomic_write_is_supported(
+        self, uri: str, feed_options: dict[str, Any]
+    ) -> bool:
+        """Validate the atomic_write feed option before any output is opened.
+
+        Atomic publication only applies to local file feeds that overwrite
+        their target. Appending, stdout and the built-in remote storage
+        backends cannot replace the target atomically and are rejected
+        upfront. Custom storage backends are validated by the storage itself
+        when it is built.
+        """
+        if not feed_options.get("atomic_write"):
+            return True
+        if feed_options.get("overwrite", False) is not True:
+            logger.error(
+                "The atomic_write feed option requires overwrite to be set to "
+                "True for feed URI: %(uri)s",
+                {"uri": uri},
+            )
+            return False
+        scheme = urlparse(uri).scheme
+        if scheme in {"ftp", "gs", "s3", "stdout"}:
+            logger.error(
+                "The atomic_write feed option is only supported by the local "
+                "file storage backend, not by the %(scheme)s storage backend "
+                "(feed URI: %(uri)s)",
+                {"scheme": scheme, "uri": uri},
+            )
+            return False
+        return True
 
     def _get_storage(
         self, uri: str, feed_options: dict[str, Any]

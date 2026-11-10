@@ -46,6 +46,7 @@ from scrapy.extensions.feedexport import (
     S3FeedStorage,
     StdoutFeedStorage,
 )
+from scrapy.extensions.postprocessing import PostProcessingManager
 from scrapy.settings import Settings
 from scrapy.utils.python import to_unicode
 from scrapy.utils.test import get_crawler
@@ -147,6 +148,166 @@ class TestFileFeedStorage(unittest.TestCase):
         path = r"C:\Users\user\Desktop\test.txt"
         storage = FileFeedStorage(path)
         assert storage.path == path
+
+
+class TestAtomicFileFeedStorage(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.spider = scrapy.Spider("default")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _path(self, name="feed.jl") -> Path:
+        return self.temp_dir / name
+
+    def _storage(self, path: Path | str | None = None) -> FileFeedStorage:
+        path = path or self._path()
+        return FileFeedStorage(
+            str(path),
+            feed_options={"atomic_write": True, "overwrite": True},
+        )
+
+    def test_interface(self):
+        verifyObject(IFeedStorage, self._storage())
+
+    def test_requires_explicit_overwrite(self):
+        path = self._path()
+        with pytest.raises(NotConfigured, match="atomic_write"):
+            FileFeedStorage(str(path), feed_options={"atomic_write": True})
+        with pytest.raises(NotConfigured, match="atomic_write"):
+            FileFeedStorage(
+                str(path),
+                feed_options={"atomic_write": True, "overwrite": False},
+            )
+
+    def test_atomic_write_flag(self):
+        assert self._storage().atomic_write is True
+        plain = FileFeedStorage(
+            str(self._path("plain.jl")), feed_options={"overwrite": True}
+        )
+        assert plain.atomic_write is False
+
+    def test_temp_file_lives_next_to_target(self):
+        path = self._path()
+        storage = self._storage(path)
+        file = storage.open(self.spider)
+        try:
+            assert Path(file.name).parent == path.parent
+            # The target itself must not exist while data is being written.
+            assert not path.exists()
+        finally:
+            storage.cleanup()
+
+    def test_temp_file_lives_next_to_target_file_uri(self):
+        path = self._path("uri.jl")
+        storage = FileFeedStorage(
+            path_to_file_uri(str(path)),
+            feed_options={"atomic_write": True, "overwrite": True},
+        )
+        file = storage.open(self.spider)
+        try:
+            assert Path(file.name).parent == path.parent
+        finally:
+            storage.cleanup()
+
+    def test_existing_file_stays_readable_until_store(self):
+        path = self._path()
+        path.write_bytes(b"previous snapshot")
+        storage = self._storage(path)
+        file = storage.open(self.spider)
+        file.write(b"partial output")
+        file.flush()
+        # The previous snapshot must remain untouched while exporting.
+        assert path.read_bytes() == b"previous snapshot"
+        storage.store(file)
+        assert path.read_bytes() == b"partial output"
+        assert not any(entry.name.endswith(".tmp") for entry in self.temp_dir.iterdir())
+
+    def test_store_direct_path(self):
+        path = self._path()
+        storage = self._storage(path)
+        file = storage.open(self.spider)
+        file.write(b"content")
+        storage.store(file)
+        assert path.read_bytes() == b"content"
+
+    def test_store_file_uri(self):
+        path = self._path("uri.jl")
+        storage = FileFeedStorage(
+            path_to_file_uri(str(path)),
+            feed_options={"atomic_write": True, "overwrite": True},
+        )
+        file = storage.open(self.spider)
+        file.write(b"content")
+        storage.store(file)
+        assert path.read_bytes() == b"content"
+
+    def test_store_creates_missing_parent_directory(self):
+        path = self._path() / "more" / "paths" / "file.txt"
+        storage = self._storage(path)
+        file = storage.open(self.spider)
+        file.write(b"content")
+        storage.store(file)
+        assert path.read_bytes() == b"content"
+
+    def test_replace_failure_keeps_target_and_removes_temp_file(self):
+        path = self._path()
+        path.write_bytes(b"previous snapshot")
+        storage = self._storage(path)
+        file = storage.open(self.spider)
+        temp_name = file.name
+        file.write(b"new snapshot")
+        with (
+            mock.patch(
+                "scrapy.extensions.feedexport.Path.replace",
+                side_effect=OSError("simulated replace failure"),
+            ),
+            pytest.raises(OSError, match="simulated replace failure"),
+        ):
+            storage.store(file)
+        # The previous snapshot is preserved and the temp file is cleaned up.
+        assert path.read_bytes() == b"previous snapshot"
+        assert not Path(temp_name).exists()
+        assert storage._file is None
+
+    def test_write_failure_keeps_target_and_removes_temp_file(self):
+        path = self._path()
+        path.write_bytes(b"previous snapshot")
+        storage = self._storage(path)
+        file = storage.open(self.spider)
+        temp_name = file.name
+        with (
+            mock.patch.object(
+                file, "fileno", side_effect=OSError("simulated write failure")
+            ),
+            pytest.raises(OSError, match="simulated write failure"),
+        ):
+            storage.store(file)
+        assert path.read_bytes() == b"previous snapshot"
+        assert not Path(temp_name).exists()
+
+    def test_cleanup_is_idempotent(self):
+        storage = self._storage()
+        file = storage.open(self.spider)
+        temp_name = file.name
+        storage.cleanup()
+        storage.cleanup()
+        assert not Path(temp_name).exists()
+
+    def test_stdout_storage_rejects_atomic_write(self):
+        with pytest.raises(NotConfigured, match="atomic_write"):
+            StdoutFeedStorage(
+                "stdout:",
+                feed_options={"atomic_write": True, "overwrite": True},
+            )
+
+    def test_ftp_storage_rejects_atomic_write(self):
+        with pytest.raises(NotConfigured, match="atomic_write"):
+            FTPFeedStorage(
+                "ftp://example.com/feed.jl",
+                feed_options={"atomic_write": True, "overwrite": True},
+            )
 
 
 class TestFTPFeedStorage(unittest.TestCase):
@@ -2935,3 +3096,382 @@ class TestURIParamsFeedOption(TestURIParams):
                 uri: options,
             },
         }
+
+
+class FailingFinishJsonLinesExporter(JsonItemExporter):
+    """JsonItemExporter that fails while finalizing the serialized output."""
+
+    def finish_exporting(self):
+        raise OSError("simulated serialization finalization failure")
+
+
+class FailingClosePostProcessingManager(PostProcessingManager):
+    """PostProcessingManager whose compression layer fails on close."""
+
+    def close(self) -> None:  # type: ignore[override]
+        raise OSError("simulated compression finalization failure")
+
+
+class TestAtomicFeedExport(TestFeedExportBase):
+    """End-to-end tests for the atomic_write FEEDS option."""
+
+    @defer.inlineCallbacks
+    def run_and_export(self, spider_cls, settings, feeds=None, cleanup=False):
+        """Run spider with specified settings; return the exported files
+        content keyed by the string feed keys provided by the caller.
+
+        Output files are not deleted here: ``tearDown`` removes the whole
+        temporary directory. Set ``cleanup=True`` to delete them explicitly.
+        """
+        feeds = feeds if feeds is not None else (settings.get("FEEDS") or {})
+        content = {}
+        target_paths = {
+            str(feed_key): Path(file_uri_to_path(str(feed_key))).resolve()
+            for feed_key in feeds
+        }
+        try:
+            spider_cls.start_urls = [self.mockserver.url("/")]
+            crawler = get_crawler(spider_cls, settings)
+            yield crawler.crawl()
+            for feed_key, path in target_paths.items():
+                content[feed_key] = path.read_bytes() if path.exists() else None
+        finally:
+            if cleanup:
+                for path in target_paths.values():
+                    if path.exists() and path.is_file():
+                        path.unlink()
+        return content, crawler
+
+    @defer.inlineCallbacks
+    def _export(self, items, settings, cleanup=False):
+        class TestSpider(scrapy.Spider):
+            name = "testspider"
+
+            def parse(self, response):
+                yield from items
+
+        # Keep a copy of the original feed keys for result indexing, then use
+        # plain string feed keys in the settings (pathlib.Path keys are
+        # converted to file URIs by the extension).
+        original_feeds = {
+            str(path): options for path, options in settings["FEEDS"].items()
+        }
+        settings["FEEDS"] = dict(original_feeds)
+        data, crawler = yield self.run_and_export(
+            TestSpider, settings, feeds=original_feeds, cleanup=cleanup
+        )
+        return data, crawler
+
+    def _atomic_options(self, fmt="jsonlines", **extra):
+        return {"format": fmt, "atomic_write": True, "overwrite": True, **extra}
+
+    def test_atomic_write_rejected_without_explicit_overwrite(self):
+        target = str(self._random_temp_filename())
+        for options in (
+            {"format": "jsonlines", "atomic_write": True},
+            {"format": "jsonlines", "atomic_write": True, "overwrite": False},
+        ):
+            crawler = get_crawler(settings_dict={"FEEDS": {target: options}})
+            with pytest.raises(NotConfigured):
+                FeedExporter(crawler)
+            assert not Path(target).exists()
+
+    def test_atomic_write_rejected_for_stdout(self):
+        settings = {
+            "FEEDS": {
+                "stdout:": self._atomic_options("xml"),
+            },
+        }
+        crawler = get_crawler(settings_dict=settings)
+        with pytest.raises(NotConfigured):
+            FeedExporter(crawler)
+
+    def test_atomic_write_rejected_for_remote_storage(self):
+        for uri in (
+            "s3://mybucket/export.jsonl",
+            "gs://mybucket/export.jsonl",
+            "ftp://example.com/export.jsonl",
+        ):
+            crawler = get_crawler(
+                settings_dict={"FEEDS": {uri: self._atomic_options()}}
+            )
+            with pytest.raises(NotConfigured):
+                FeedExporter(crawler)
+
+    @defer.inlineCallbacks
+    def test_successful_atomic_write_replaces_old_file(self):
+        target = self._random_temp_filename()
+        target.write_bytes(b"previous snapshot")
+        settings = {"FEEDS": {target: self._atomic_options()}}
+        data, crawler = yield self._export([{"foo": "bar"}], settings)
+        assert [json.loads(line) for line in data[str(target)].splitlines()] == [
+            {"foo": "bar"}
+        ]
+        assert crawler.stats.get_value("feedexport/success_count/FileFeedStorage") == 1
+        # No temporary file is left behind in the target directory.
+        assert not any(entry.name.endswith(".tmp") for entry in target.parent.iterdir())
+
+    @defer.inlineCallbacks
+    def test_successful_atomic_write_file_uri(self):
+        target = self._random_temp_filename()
+        uri = path_to_file_uri(str(target))
+        settings = {"FEEDS": {uri: self._atomic_options()}}
+        data, crawler = yield self._export([{"foo": "bar"}], settings)
+        assert data[uri] == b'{"foo": "bar"}\n'
+        assert target.exists()
+        assert crawler.stats.get_value("feedexport/success_count/FileFeedStorage") == 1
+
+    @defer.inlineCallbacks
+    def test_target_does_not_exist_during_export(self):
+        target = self._random_temp_filename()
+        seen_during_export = []
+
+        class ObservingFileFeedStorage(FileFeedStorage):
+            def store(self, file):
+                seen_during_export.append(target.exists())
+                return super().store(file)
+
+        settings = {
+            "FEEDS": {target: self._atomic_options()},
+            "FEED_STORAGES": {"": ObservingFileFeedStorage},
+        }
+        yield self._export([{"foo": "bar"}], settings)
+        assert seen_during_export == [False]
+        assert target.exists()
+
+    @defer.inlineCallbacks
+    def test_atomic_batches_are_published_independently(self):
+        items = [{"foo": f"bar{i}"} for i in range(4)]
+        mark = self._random_temp_filename() / "jl" / "_%(batch_id)02d_"
+        settings = {
+            "FEEDS": {
+                mark: {
+                    **self._atomic_options(),
+                    "batch_item_count": 2,
+                },
+            },
+        }
+        data, crawler = yield self._export(items, settings)
+        batch_files = sorted(mark.parent.iterdir())
+        assert len(batch_files) == 2
+        for batch_file in batch_files:
+            assert batch_file.suffix != ".tmp"
+            lines = [json.loads(line) for line in batch_file.read_bytes().splitlines()]
+            assert len(lines) == 2
+        assert crawler.stats.get_value("feedexport/success_count/FileFeedStorage") == 2
+
+    @defer.inlineCallbacks
+    def test_atomic_write_with_gzip_postprocessing(self):
+        target = self._random_temp_filename().with_suffix(".jl.gz")
+        settings = {
+            "FEEDS": {
+                target: self._atomic_options(
+                    postprocessing=["scrapy.extensions.postprocessing.GzipPlugin"]
+                ),
+            },
+        }
+        data, crawler = yield self._export([{"foo": "bar"}], settings)
+        assert gzip.decompress(data[str(target)]) == b'{"foo": "bar"}\n'
+        assert crawler.stats.get_value("feedexport/success_count/FileFeedStorage") == 1
+        assert not any(entry.name.endswith(".tmp") for entry in target.parent.iterdir())
+
+    @defer.inlineCallbacks
+    def test_empty_output_respects_store_empty_true(self):
+        target = self._random_temp_filename()
+        target.write_bytes(b"previous snapshot")
+        settings = {
+            "FEEDS": {target: self._atomic_options()},
+            "FEED_STORE_EMPTY": True,
+        }
+        data, _ = yield self._export([], settings)
+        # store_empty=True: the empty output is published atomically. The
+        # JSON Lines representation of an empty feed is an empty file.
+        assert data[str(target)] == b""
+        assert target.read_bytes() == b""
+        assert not any(entry.name.endswith(".tmp") for entry in target.parent.iterdir())
+
+    @defer.inlineCallbacks
+    def test_empty_output_respects_store_empty_false(self):
+        target = self._random_temp_filename()
+        target.write_bytes(b"previous snapshot")
+        settings = {
+            "FEEDS": {target: self._atomic_options()},
+            "FEED_STORE_EMPTY": False,
+        }
+        data, crawler = yield self._export([], settings)
+        # store_empty=False: nothing is published, the existing file remains.
+        assert data[str(target)] == b"previous snapshot"
+        assert target.read_bytes() == b"previous snapshot"
+        assert (
+            "feedexport/success_count/FileFeedStorage" not in crawler.stats.get_stats()
+        )
+        assert not any(entry.name.endswith(".tmp") for entry in target.parent.iterdir())
+
+    @defer.inlineCallbacks
+    def test_serialization_failure_does_not_publish_batch(self):
+        target = self._random_temp_filename()
+        target.write_bytes(b"previous snapshot")
+        settings = {
+            "FEEDS": {target: self._atomic_options()},
+            "FEED_EXPORTERS": {"jsonlines": ExceptionJsonItemExporter},
+        }
+        with LogCapture() as log:
+            data, crawler = yield self._export([{"foo": "bar"}], settings)
+        # The previous snapshot stays in place and no temp file is left.
+        assert data[str(target)] == b"previous snapshot"
+        assert target.read_bytes() == b"previous snapshot"
+        assert not any(entry.name.endswith(".tmp") for entry in target.parent.iterdir())
+        stats = crawler.stats.get_stats()
+        assert stats["feedexport/failed_count/FileFeedStorage"] == 1
+        assert "feedexport/success_count/FileFeedStorage" not in stats
+        assert "Error storing" in str(log)
+
+    @defer.inlineCallbacks
+    def test_finalization_failure_does_not_publish_batch(self):
+        target = self._random_temp_filename()
+        target.write_bytes(b"previous snapshot")
+        settings = {
+            "FEEDS": {target: self._atomic_options()},
+            "FEED_EXPORTERS": {"jsonlines": FailingFinishJsonLinesExporter},
+        }
+        with LogCapture() as log:
+            data, crawler = yield self._export([{"foo": "bar"}], settings)
+        assert data[str(target)] == b"previous snapshot"
+        assert target.read_bytes() == b"previous snapshot"
+        assert not any(entry.name.endswith(".tmp") for entry in target.parent.iterdir())
+        assert crawler.stats.get_value("feedexport/failed_count/FileFeedStorage") == 1
+        assert "Error storing" in str(log)
+
+    @defer.inlineCallbacks
+    def test_postprocessing_close_failure_does_not_publish_batch(self):
+        target = self._random_temp_filename().with_suffix(".jl.gz")
+        target.write_bytes(b"previous snapshot")
+        settings = {
+            "FEEDS": {
+                target: self._atomic_options(
+                    postprocessing=["scrapy.extensions.postprocessing.GzipPlugin"]
+                ),
+            },
+        }
+        with mock.patch(
+            "scrapy.extensions.feedexport.PostProcessingManager",
+            FailingClosePostProcessingManager,
+        ):
+            data, crawler = yield self._export([{"foo": "bar"}], settings)
+        assert data[str(target)] == b"previous snapshot"
+        assert target.read_bytes() == b"previous snapshot"
+        assert not any(entry.name.endswith(".tmp") for entry in target.parent.iterdir())
+        assert crawler.stats.get_value("feedexport/failed_count/FileFeedStorage") == 1
+
+    @defer.inlineCallbacks
+    def test_replace_failure_does_not_publish_batch(self):
+        target = self._random_temp_filename()
+        target.write_bytes(b"previous snapshot")
+        settings = {"FEEDS": {target: self._atomic_options()}}
+        with (
+            mock.patch(
+                "scrapy.extensions.feedexport.Path.replace",
+                side_effect=OSError("simulated replace failure"),
+            ),
+            LogCapture(),
+        ):
+            data, crawler = yield self._export([{"foo": "bar"}], settings)
+        assert data[str(target)] == b"previous snapshot"
+        assert target.read_bytes() == b"previous snapshot"
+        assert not any(entry.name.endswith(".tmp") for entry in target.parent.iterdir())
+        assert crawler.stats.get_value("feedexport/failed_count/FileFeedStorage") == 1
+
+    @defer.inlineCallbacks
+    def test_failing_atomic_feed_does_not_affect_other_feed(self):
+        good_target = self._random_temp_filename()
+        bad_target = self._random_temp_filename()
+        bad_target.write_bytes(b"previous bad snapshot")
+        bad_uri = f"fail://{bad_target}"
+
+        class FailingStoreFileFeedStorage(FileFeedStorage):
+            def __init__(self, uri, *, feed_options=None):
+                super().__init__(uri.removeprefix("fail://"), feed_options=feed_options)
+
+            def store(self, file):
+                raise OSError("simulated store failure")
+
+        class TestSpider(scrapy.Spider):
+            name = "testspider"
+
+            def parse(self, response):
+                yield {"foo": "bar"}
+
+        settings = {
+            "FEEDS": {
+                str(good_target): self._atomic_options(),
+                bad_uri: self._atomic_options(),
+            },
+            "FEED_STORAGES": {"fail": FailingStoreFileFeedStorage},
+        }
+        with LogCapture():
+            data, crawler = yield self.run_and_export(
+                TestSpider,
+                settings,
+                feeds={
+                    str(good_target): self._atomic_options(),
+                    bad_uri: self._atomic_options(),
+                },
+            )
+        # The healthy feed is published normally.
+        assert [json.loads(line) for line in data[str(good_target)].splitlines()] == [
+            {"foo": "bar"}
+        ]
+        # The failed feed keeps its previous snapshot.
+        assert data[bad_uri] == b"previous bad snapshot"
+        assert bad_target.read_bytes() == b"previous bad snapshot"
+        stats = crawler.stats.get_stats()
+        assert stats["feedexport/success_count/FileFeedStorage"] == 1
+        assert stats["feedexport/failed_count/FailingStoreFileFeedStorage"] == 1
+        assert not any(
+            entry.name.endswith(".tmp") for entry in good_target.parent.iterdir()
+        )
+
+    @defer.inlineCallbacks
+    def test_default_mode_remains_backward_compatible(self):
+        # A plain overwrite feed without atomic_write keeps writing directly
+        # to the target file.
+        target = self._random_temp_filename()
+        seen_during_export = []
+
+        class ObservingFileFeedStorage(FileFeedStorage):
+            def open(self, spider):
+                file = super().open(spider)
+                seen_during_export.append(target.exists())
+                return file
+
+        settings = {
+            "FEEDS": {target: {"format": "jsonlines", "overwrite": True}},
+            "FEED_STORAGES": {"": ObservingFileFeedStorage},
+        }
+        data, crawler = yield self._export([{"foo": "bar"}], settings)
+        # In the default mode the target file exists already while it is
+        # being written (no atomic redirection to a temporary file).
+        assert seen_during_export == [True]
+        assert [json.loads(line) for line in data[str(target)].splitlines()] == [
+            {"foo": "bar"}
+        ]
+        assert (
+            crawler.stats.get_value("feedexport/success_count/ObservingFileFeedStorage")
+            == 1
+        )
+
+    @defer.inlineCallbacks
+    def test_default_mode_export_failure_preserves_historical_behavior(self):
+        target = self._random_temp_filename()
+        settings = {
+            "FEEDS": {target: {"format": "jsonlines", "overwrite": True}},
+            "FEED_EXPORTERS": {"jsonlines": ExceptionJsonItemExporter},
+        }
+        # Non-atomic feeds do not get a failed_count entry: the signal
+        # machinery logs the export error itself and the slot still goes
+        # through the regular store path, exactly as before atomic_write
+        # existed.
+        with LogCapture():
+            _, crawler = yield self._export([{"foo": "bar"}], settings)
+        stats = crawler.stats.get_stats()
+        assert not any(key.startswith("feedexport/failed_count/") for key in stats)

@@ -3,6 +3,22 @@
 Release notes
 =============
 
+.. _release-2.14.0:
+
+Scrapy 2.14.0 (unreleased)
+--------------------------
+
+New features
+~~~~~~~~~~~~
+
+-   Added an ``atomic_write`` feed option for local file feeds. When enabled
+    together with ``overwrite`` set to ``True``, the feed is written to a
+    temporary file in the target directory and the target file is replaced
+    atomically only after the exporter and the post-processing layers have
+    finished successfully. Failures no longer leave a partially written feed
+    or destroy the previous valid snapshot. See
+    :ref:`atomic-feed-writes`.
+
 .. _release-2.13.4:
 
 Scrapy 2.13.4 (2025-11-17)

@@ -164,6 +164,10 @@ Note that for the local filesystem storage (only) you can omit the scheme if
 you specify an absolute path like ``/tmp/export.csv`` (Unix systems only).
 Alternatively you can also use a :class:`pathlib.Path` object.
 
+Use the ``atomic_write`` feed option to publish these feeds atomically, so
+that the target file always contains a complete snapshot. See
+:ref:`atomic-feed-writes`.
+
 .. _topics-feed-storage-ftp:
 
 FTP
@@ -296,6 +300,94 @@ backends, use :setting:`FEED_EXPORT_BATCH_ITEM_COUNT` to split the output items
 in multiple files, with the specified maximum item count per file. That way, as
 soon as a file reaches the maximum item count, that file is delivered to the
 feed URI, allowing item delivery to start way before the end of the crawl.
+
+
+.. _atomic-feed-writes:
+
+Atomic feed writes
+------------------
+
+.. versionadded:: 2.14
+
+When a feed is written directly to its target file, as happens by default for
+the :ref:`local filesystem storage backend <topics-feed-storage-fs>`, a reader
+of that file can observe a partially written feed while the crawl is running,
+and a serialization, post-processing or disk failure may leave the target file
+in an invalid state, destroying the previous valid snapshot.
+
+Set the ``atomic_write`` feed option to ``True`` to publish local file feeds
+atomically instead::
+
+    {
+        'snapshots/items.jsonl': {
+            'format': 'jsonlines',
+            'overwrite': True,
+            'atomic_write': True,
+        },
+        pathlib.Path('snapshots/items.csv.gz'): {
+            'format': 'csv',
+            'overwrite': True,
+            'atomic_write': True,
+            'postprocessing': ['scrapy.extensions.postprocessing.GzipPlugin'],
+        },
+    }
+
+When ``atomic_write`` is enabled:
+
+-   The output is written to a temporary file created in the same directory as
+    the target file, so the final step is an atomic same-filesystem operation.
+    The target file is not created or modified while exporting.
+
+-   Only once the item exporter and every post-processing layer (for example a
+    compression plugin) have finished successfully, and the temporary file has
+    been flushed and closed, is the target file replaced atomically with
+    :func:`os.replace`.
+
+-   If serialization, post-processing finalization, the final write or the
+    replacement fails, the batch is not published: any pre-existing target
+    file is left untouched, the temporary file is removed, and the failure is
+    reported through the usual feed export logs and stats
+    (``feedexport/failed_count/...``). A failed batch is never treated as a
+    successful one when the spider closes.
+
+-   An existing target file remains readable and unchanged until the moment of
+    the atomic replacement.
+
+-   With :setting:`FEED_EXPORT_BATCH_ITEM_COUNT`, every batch is exported into
+    its own temporary file and published independently, so a failed batch does
+    not prevent the other batches from being published.
+
+-   Empty outputs follow the regular :setting:`FEED_STORE_EMPTY` rule: when
+    empty feeds are stored, the empty output is itself published atomically.
+
+Requirements and limitations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+-   ``atomic_write`` requires the ``overwrite`` feed option to be explicitly
+    set to ``True``. It cannot be combined with appending.
+
+-   It is only supported by the local filesystem storage backend (plain paths
+    and ``file`` URIs). Using it with the standard output storage or with a
+    remote storage backend (FTP, S3, GCS, ...) raises an error before any
+    output file is opened.
+
+-   The replacement relies on :func:`os.replace`, which is atomic for a single
+    process on POSIX and Windows as long as the source and target are on the
+    same filesystem; the temporary file is always created next to the target
+    to guarantee this.
+
+-   If the Scrapy process is killed (for example with ``SIGKILL``) or the
+    machine loses power before the replacement happens, the target file keeps
+    its previous content but the temporary file may remain on disk; Scrapy
+    does not remove stale temporary files from previous runs. If the process
+    is killed during the replacement itself, the target contains either the
+    old or the new complete content, never a partial file.
+
+-   Several processes exporting to the same target path are not coordinated:
+    there is no cross-process lock. The last successful replacement wins, and
+    each process still publishes a complete, internally consistent file. Use
+    distinct target paths (for example including ``%(time)s`` or
+    ``%(batch_id)d``) when running concurrent crawls.
 
 
 .. _item-filter:
@@ -523,6 +615,29 @@ as a fallback value if that key is not provided for a specific feed definition:
     -   :ref:`topics-feed-storage-stdout`: ``False`` (overwriting is not supported)
 
     .. versionadded:: 2.4.0
+
+-   ``atomic_write``: whether to publish a local file feed atomically
+    (``True``) or write to the target file directly (``False``, the default).
+
+    When enabled, the feed is first written into a temporary file located in
+    the same directory as the target file. Only after the exporter and the
+    post-processing layers have finished successfully and the temporary file
+    has been flushed and closed is the target file replaced atomically using
+    :func:`os.replace`. As a result, readers of the target file keep seeing
+    the previous, complete snapshot while the crawl is running, and a failed
+    or interrupted crawl never leaves a partially written file behind.
+
+    This option only applies to the :ref:`local filesystem storage backend
+    <topics-feed-storage-fs>`, including plain paths and ``file`` URIs, and it
+    works with :setting:`FEED_EXPORT_BATCH_ITEM_COUNT` batched feeds where each
+    batch file is published independently. It requires ``overwrite`` to be
+    set to ``True`` and is rejected (before any output file is opened) for
+    appending feeds, the standard output storage and remote storage backends.
+
+    See :ref:`atomic-feed-writes` for details, including the guarantees and
+    the limitations of this mode.
+
+    .. versionadded:: 2.14
 
 -   ``store_empty``: falls back to :setting:`FEED_STORE_EMPTY`.
 
